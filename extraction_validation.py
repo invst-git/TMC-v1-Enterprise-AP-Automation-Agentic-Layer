@@ -77,6 +77,10 @@ class ExtractionValidationResult:
     def requires_review(self) -> bool:
         return self.decision == "needs_review"
 
+    @property
+    def blocks_persistence(self) -> bool:
+        return any(issue.code == "potential_duplicate_invoice" for issue in self.issues)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "invoice_path": self.invoice_path,

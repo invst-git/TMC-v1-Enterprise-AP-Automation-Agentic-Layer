@@ -5,8 +5,10 @@ from extraction_validation import extract_and_validate_invoice, finalize_source_
 from invoice_db import save_invoice_to_db
 from matching_orchestration import match_invoice_with_review
 from pdf_segmentation import build_segmentation_log_lines, segment_pdf_document
+from realtime_events import publish_live_update
 from source_document_tracking import persist_source_document_segmentation_best_effort
 from source_document_tracking import update_source_document_segment_best_effort
+from user_facing_errors import DuplicateInvoiceBlockedError, get_user_facing_message
 
 
 def _segment_label(
@@ -48,6 +50,13 @@ def process_saved_invoice_file(
             f"Persisted {len(persisted_segmentation['segments'])} source document segment record(s) "
             f"for source document {source_document_id}"
         )
+        publish_live_update(
+            "source_document.segmented",
+            {
+                "sourceDocumentId": source_document_id,
+                "segmentCount": len(persisted_segmentation["segments"]),
+            },
+        )
     elif segmentation_warning:
         logs.append(f"Source document segmentation persistence skipped: {segmentation_warning}")
 
@@ -86,12 +95,38 @@ def process_saved_invoice_file(
             )
         if validation.review_item_id:
             logs.append(f"Extraction review queued for {label}; review item {validation.review_item_id}")
+        if getattr(validation, "blocks_persistence", False):
+            duplicate_ids = [candidate["id"] for candidate in validation.duplicate_candidates if candidate.get("confidence", 0) >= 0.75]
+            logs.append(f"Duplicate invoice blocked for {label}; existing invoice(s) {', '.join(duplicate_ids[:3]) or 'already exist'}")
+            _, segment_update_warning = update_source_document_segment_best_effort(
+                segment_record_id,
+                status="duplicate_blocked",
+                metadata={
+                    "duplicate_detection": {
+                        "decision": "blocked",
+                        "duplicate_invoice_ids": duplicate_ids[:10],
+                        "review_item_id": validation.review_item_id,
+                    }
+                },
+            )
+            if segment_update_warning:
+                logs.append(f"Source segment duplicate update skipped for {label}: {segment_update_warning}")
+            publish_live_update(
+                "invoice.duplicate_blocked",
+                {
+                    "sourceDocumentId": source_document_id,
+                    "sourceDocumentSegmentId": segment_record_id,
+                    "duplicateInvoiceIds": duplicate_ids[:10],
+                },
+            )
+            continue
 
         try:
-            invoice_id = save_invoice_to_db(json_path, segment_path, from_email, message_id, vendor_id_override)
-            if not invoice_id:
+            save_result = save_invoice_to_db(json_path, segment_path, from_email, message_id, vendor_id_override)
+            if not save_result:
                 logs.append(f"Failed to save {label} to Supabase")
                 continue
+            invoice_id = save_result.invoice_id
             invoice_ids.append(invoice_id)
             logs.append(f"Invoice saved to Supabase with id={invoice_id}")
             _, segment_update_warning = update_source_document_segment_best_effort(
@@ -107,8 +142,25 @@ def process_saved_invoice_file(
             )
             if segment_update_warning:
                 logs.append(f"Source segment linkage skipped for {label}: {segment_update_warning}")
+            publish_live_update(
+                "invoice.persisted",
+                {
+                    "invoiceId": invoice_id,
+                    "sourceDocumentId": source_document_id,
+                },
+            )
+        except DuplicateInvoiceBlockedError as exc:
+            logs.append(get_user_facing_message(exc))
+            publish_live_update(
+                "invoice.duplicate_blocked",
+                {
+                    "sourceDocumentId": source_document_id,
+                    "message": get_user_facing_message(exc),
+                },
+            )
+            continue
         except Exception as exc:
-            logs.append(f"DB persistence error for {label}: {exc}")
+            logs.append(f"Could not save {label}: {get_user_facing_message(exc)}")
             continue
 
         try:
@@ -128,12 +180,28 @@ def process_saved_invoice_file(
                         f"PO matching review queued for invoice {invoice_id}; "
                         f"review item {match_outcome.review_item_id}"
                     )
+            publish_live_update(
+                "invoice.matching_updated",
+                {
+                    "invoiceId": invoice_id,
+                    "matchedPoId": match_outcome.matched_po_id,
+                    "workflowState": match_outcome.workflow_state,
+                    "reviewItemId": match_outcome.review_item_id,
+                },
+            )
         except Exception as exc:
-            logs.append(f"PO matching error for invoice {invoice_id}: {exc}")
+            logs.append(f"PO matching could not complete for invoice {invoice_id}: {get_user_facing_message(exc)}")
 
     extraction_status = finalize_source_document_extraction_best_effort(source_document_id, validation_results)
     if extraction_status:
         logs.append(f"Source document extraction finalized with status {extraction_status}")
+        publish_live_update(
+            "source_document.extraction_finalized",
+            {
+                "sourceDocumentId": source_document_id,
+                "extractionStatus": extraction_status,
+            },
+        )
 
     return {
         "logs": logs,

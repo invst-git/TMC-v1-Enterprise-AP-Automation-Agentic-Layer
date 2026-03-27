@@ -4,6 +4,8 @@ from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from db import get_conn
 import stripe
+from realtime_events import publish_live_update
+from user_facing_errors import UserFacingError
 
 load_dotenv()
 
@@ -28,6 +30,115 @@ def _minor_units(amount: float, currency: str) -> int:
     return int(round(float(amount) * 100))
 
 
+def _payment_intent_idempotency_key(
+    invoice_ids: List[str],
+    *,
+    email: str,
+    total: float,
+    currency: str,
+    save_method: bool,
+) -> str:
+    key_parts = [
+        ",".join(sorted(str(invoice_id) for invoice_id in invoice_ids)),
+        (email or "").strip().lower(),
+        f"{float(total):.2f}",
+        (currency or "").strip().lower(),
+        "save_method=1" if save_method else "save_method=0",
+    ]
+    return hashlib.sha256("|".join(key_parts).encode()).hexdigest()
+
+
+def _get_linked_invoice_ids(cur, payment_id: str) -> set[str]:
+    cur.execute("SELECT invoice_id FROM payment_invoices WHERE payment_id=%s", (payment_id,))
+    return {str(row[0]) for row in cur.fetchall()}
+
+
+def _normalize_text(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _invoice_signature(row: tuple) -> Optional[str]:
+    rid, amount, curr, status, vendor_id, invoice_number, invoice_date, supplier_name = row
+    if not invoice_number or amount is None:
+        return None
+    vendor_key = str(vendor_id) if vendor_id else _normalize_text(supplier_name)
+    if not vendor_key:
+        return None
+    return "|".join(
+        [
+            vendor_key,
+            _normalize_text(invoice_number),
+            f"{float(amount):.2f}",
+            invoice_date.isoformat() if invoice_date else "",
+        ]
+    )
+
+
+def _assert_no_duplicate_payment_conflicts(cur, rows: List[tuple], requested_invoice_ids: set[str]) -> None:
+    signatures: Dict[str, str] = {}
+    for row in rows:
+        signature = _invoice_signature(row)
+        if not signature:
+            continue
+        invoice_id = str(row[0])
+        existing = signatures.get(signature)
+        if existing and existing != invoice_id:
+            raise UserFacingError(
+                "A duplicate invoice was detected in this payment request. Remove the duplicate and try again.",
+                code="duplicate_payment_blocked",
+                status_code=409,
+            )
+        signatures[signature] = invoice_id
+
+    for row in rows:
+        signature = _invoice_signature(row)
+        if not signature:
+            continue
+        rid, amount, curr, status, vendor_id, invoice_number, invoice_date, supplier_name = row
+        cur.execute(
+            """
+            SELECT id, status
+            FROM invoices
+            WHERE id <> %s
+              AND lower(coalesce(invoice_number, '')) = lower(%s)
+              AND abs(coalesce(total_amount, 0) - %s) <= 0.01
+              AND (
+                (%s IS NOT NULL AND vendor_id = %s)
+                OR (
+                    %s IS NULL
+                    AND vendor_id IS NULL
+                    AND lower(coalesce(supplier_name, '')) = lower(%s)
+                )
+              )
+              AND (
+                (%s IS NULL AND invoice_date IS NULL)
+                OR invoice_date = %s
+              )
+            LIMIT 10
+            """,
+            (
+                rid,
+                invoice_number,
+                float(amount),
+                vendor_id,
+                vendor_id,
+                vendor_id,
+                supplier_name,
+                invoice_date,
+                invoice_date,
+            ),
+        )
+        for duplicate_invoice_id, duplicate_status in cur.fetchall():
+            if str(duplicate_invoice_id) in requested_invoice_ids:
+                continue
+            if duplicate_status in {"paid", "payment_pending"}:
+                raise UserFacingError(
+                    "A duplicate version of this invoice has already been paid or is already in payment. This payment was blocked to prevent a double charge.",
+                    code="duplicate_payment_blocked",
+                    status_code=409,
+                )
+
+
 def create_payment_intent_for_invoices(
     invoice_ids: List[str],
     customer: Dict[str, Any],
@@ -50,7 +161,7 @@ def create_payment_intent_for_invoices(
             # Lock invoices and validate
             cur.execute(
                 """
-                SELECT id, total_amount, currency, status, vendor_id
+                SELECT id, total_amount, currency, status, vendor_id, invoice_number, invoice_date, supplier_name
                 FROM invoices
                 WHERE id = ANY(%s)
                 FOR UPDATE
@@ -60,15 +171,15 @@ def create_payment_intent_for_invoices(
             rows = cur.fetchall()
             if len(rows) != len(invoice_ids):
                 raise ValueError("Some invoices not found")
+            requested_invoice_ids = {str(row[0]) for row in rows}
 
             total = 0.0
             currencies = set()
             allowed_status = {"matched_auto", "ready_for_payment"}
-            for rid, amount, curr, status, vendor_id in rows:
-                if status in ("paid", "payment_pending"):
-                    raise ValueError("One or more invoices are already paid or pending")
-                if status not in allowed_status:
-                    raise ValueError("One or more invoices are not eligible for payment")
+            _assert_no_duplicate_payment_conflicts(cur, rows, requested_invoice_ids)
+            for rid, amount, curr, status, vendor_id, invoice_number, invoice_date, supplier_name in rows:
+                if status == "paid":
+                    raise ValueError("One or more invoices are already paid")
                 if amount is None:
                     raise ValueError("Invoice missing total amount")
                 total += float(amount)
@@ -81,19 +192,64 @@ def create_payment_intent_for_invoices(
                 raise ValueError("Mixed currency selection is not allowed")
             final_currency = (list(currencies)[0] if currencies else (currency or "USD")).lower()
 
-            # Insert payment record
+            # Create or retrieve the PaymentIntent first. Stripe may return the same
+            # object for identical idempotent retries, and the local DB should reuse
+            # the existing payment row in that case.
+            idemp_key = _payment_intent_idempotency_key(
+                invoice_ids,
+                email=email,
+                total=total,
+                currency=final_currency,
+                save_method=save_method,
+            )
+            intent = stripe.PaymentIntent.create(
+                amount=_minor_units(total, final_currency),
+                currency=final_currency,
+                metadata={
+                    "invoice_ids": ",".join(invoice_ids),
+                    "customer_email": email or "",
+                },
+                receipt_email=email or None,
+                setup_future_usage=("off_session" if save_method else None),
+                automatic_payment_methods={"enabled": True},
+                idempotency_key=idemp_key,
+            )
+
+            # Insert or reuse the payment record for this Stripe intent.
             cur.execute(
                 """
-                INSERT INTO payments(amount, currency, customer_email, status)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO payments(stripe_payment_intent_id, amount, currency, customer_email, status)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (stripe_payment_intent_id)
+                DO UPDATE SET
+                    amount = EXCLUDED.amount,
+                    currency = EXCLUDED.currency,
+                    customer_email = EXCLUDED.customer_email,
+                    status = EXCLUDED.status
                 RETURNING id
                 """,
-                (total, final_currency, email or None, "requires_confirmation"),
+                (intent.id, total, final_currency, email or None, "requires_confirmation"),
             )
             payment_id = cur.fetchone()[0]
 
-            # Insert link rows, and set invoices to payment_pending
-            for rid, amount, curr, status, vendor_id in rows:
+            existing_linked_ids = _get_linked_invoice_ids(cur, payment_id)
+            requested_invoice_ids = {str(rid) for rid, *_ in rows}
+            if not existing_linked_ids.issubset(requested_invoice_ids):
+                raise RuntimeError("Existing payment links do not match the requested invoice selection")
+
+            for rid, amount, curr, status, vendor_id, invoice_number, invoice_date, supplier_name in rows:
+                rid_str = str(rid)
+                if status == "payment_pending":
+                    if rid_str not in existing_linked_ids:
+                        raise ValueError("One or more invoices are already pending under another payment")
+                    continue
+                if status not in allowed_status:
+                    raise ValueError("One or more invoices are not eligible for payment")
+
+            # Insert any missing link rows, and set eligible invoices to payment_pending.
+            for rid, amount, curr, status, vendor_id, invoice_number, invoice_date, supplier_name in rows:
+                if str(rid) in existing_linked_ids:
+                    continue
                 cur.execute(
                     """
                     INSERT INTO payment_invoices(payment_id, invoice_id, amount_applied, previous_status)
@@ -111,31 +267,7 @@ def create_payment_intent_for_invoices(
                 (invoice_ids,),
             )
 
-            # Prepare PaymentIntent
-            idemp_key = hashlib.sha256(("|".join(sorted(invoice_ids)) + "|" + (email or "") + f"|{total:.2f}|{final_currency}").encode()).hexdigest()
-            intent = stripe.PaymentIntent.create(
-                amount=_minor_units(total, final_currency),
-                currency=final_currency,
-                metadata={
-                    "invoice_ids": ",".join(invoice_ids),
-                    "payment_id": str(payment_id),
-                    "customer_email": email or "",
-                },
-                receipt_email=email or None,
-                setup_future_usage=("off_session" if save_method else None),
-                automatic_payment_methods={"enabled": True},
-                idempotency_key=idemp_key,
-            )
-
-            # Store intent id
-            cur.execute(
-                """
-                UPDATE payments SET stripe_payment_intent_id=%s WHERE id=%s
-                """,
-                (intent.id, payment_id),
-            )
-
-            return {
+            result = {
                 "paymentId": str(payment_id),
                 "clientSecret": intent.client_secret,
                 "paymentIntentId": intent.id,
@@ -143,6 +275,17 @@ def create_payment_intent_for_invoices(
                 "currency": final_currency,
                 "invoiceIds": invoice_ids,
             }
+            publish_live_update(
+                "payment.intent_created",
+                {
+                    "paymentId": str(payment_id),
+                    "paymentIntentId": intent.id,
+                    "invoiceIds": invoice_ids,
+                    "amount": total,
+                    "currency": final_currency,
+                },
+            )
+            return result
 
 
 def mark_payment_succeeded(payment_intent_id: str) -> None:
@@ -160,6 +303,13 @@ def mark_payment_succeeded(payment_intent_id: str) -> None:
             if ids:
                 cur.execute("UPDATE invoices SET status='paid' WHERE id = ANY(%s)", (ids,))
             cur.execute("UPDATE payments SET status='succeeded' WHERE id=%s", (payment_id,))
+            publish_live_update(
+                "payment.succeeded",
+                {
+                    "paymentIntentId": payment_intent_id,
+                    "invoiceIds": [str(invoice_id) for invoice_id in ids],
+                },
+            )
 
 
 def mark_payment_failed_or_canceled(payment_intent_id: str) -> None:
@@ -173,9 +323,18 @@ def mark_payment_failed_or_canceled(payment_intent_id: str) -> None:
             payment_id = row[0]
             # Revert invoice statuses
             cur.execute("SELECT invoice_id, previous_status FROM payment_invoices WHERE payment_id=%s", (payment_id,))
+            reverted_ids = []
             for inv_id, prev in cur.fetchall():
                 cur.execute("UPDATE invoices SET status=%s WHERE id=%s", (prev or 'ready_for_payment', inv_id))
+                reverted_ids.append(str(inv_id))
             cur.execute("UPDATE payments SET status='failed' WHERE id=%s", (payment_id,))
+            publish_live_update(
+                "payment.reverted",
+                {
+                    "paymentIntentId": payment_intent_id,
+                    "invoiceIds": reverted_ids,
+                },
+            )
 
 
 def confirm_payment_intent(payment_intent_id: str) -> Dict[str, Any]:

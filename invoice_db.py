@@ -1,6 +1,19 @@
 import os,json,datetime
+from dataclasses import dataclass
 from typing import Any,Dict,Optional
 from db import get_conn
+from user_facing_errors import DuplicateInvoiceBlockedError
+
+
+@dataclass
+class SaveInvoiceResult:
+    invoice_id: str
+    status: str
+    duplicate_of_invoice_id: Optional[str] = None
+
+    @property
+    def is_duplicate_blocked(self) -> bool:
+        return self.status == "duplicate_blocked"
 
 def _parse_date(value:Any):
     if not value:
@@ -12,7 +25,7 @@ def _parse_date(value:Any):
     except Exception:
         return None
 
-def save_invoice_to_db(fields_json_path:str,file_path:str,from_email:Optional[str],message_id:str,vendor_id_override:Optional[str]=None)->Optional[str]:
+def save_invoice_to_db(fields_json_path:str,file_path:str,from_email:Optional[str],message_id:str,vendor_id_override:Optional[str]=None)->Optional[SaveInvoiceResult]:
     with open(fields_json_path,"r",encoding="utf-8") as f:
         data:Dict[str,Any]=json.load(f)
     supplier_name=data.get("supplier_name")
@@ -66,6 +79,23 @@ def save_invoice_to_db(fields_json_path:str,file_path:str,from_email:Optional[st
                     if row:
                         vendor_id=row[0]
                 # Do not auto-create vendors on ingest; leave vendor_id as None
+
+            duplicate_candidates = find_duplicate_invoice_candidates(
+                invoice_number,
+                vendor_id=vendor_id,
+                supplier_name=supplier_name,
+                total_amount=total_amount,
+                invoice_date=invoice_date,
+            )
+            strong_duplicate = next(
+                (candidate for candidate in duplicate_candidates if candidate.get("confidence", 0) >= 0.75),
+                None,
+            )
+            if strong_duplicate:
+                raise DuplicateInvoiceBlockedError(
+                    "Duplicate invoice blocked before persistence.",
+                    duplicate_invoice_id=strong_duplicate.get("id"),
+                )
             cur.execute(
                 """
                 insert into invoices(
@@ -128,7 +158,7 @@ def save_invoice_to_db(fields_json_path:str,file_path:str,from_email:Optional[st
                       line_po_number,po_line_number
                     )
                 )
-    return str(invoice_id)
+    return SaveInvoiceResult(invoice_id=str(invoice_id), status=status)
 
 
 def find_duplicate_invoice_candidates(
@@ -154,7 +184,10 @@ def find_duplicate_invoice_candidates(
         with conn.cursor() as cur:
             where = ["lower(i.invoice_number) = lower(%s)"]
             params: list[Any] = [normalized_invoice_number]
-            if vendor_id:
+            if vendor_id and normalized_supplier_name:
+                where.append("(i.vendor_id = %s OR lower(coalesce(i.supplier_name,'')) = lower(%s))")
+                params.extend([vendor_id, normalized_supplier_name])
+            elif vendor_id:
                 where.append("i.vendor_id = %s")
                 params.append(vendor_id)
             elif normalized_supplier_name:
@@ -543,7 +576,35 @@ def get_payable_invoices(vendor_id:Optional[str]=None, currency:Optional[str]=No
     """Return invoices that are eligible for payment: matched or ready_for_payment, not already paid or pending."""
     with get_conn() as conn:
         with conn.cursor() as cur:
-            where = ["i.status IN ('matched_auto','ready_for_payment')", "i.status NOT IN ('paid','payment_pending')"]
+            where = [
+                "i.status IN ('matched_auto','ready_for_payment')",
+                "i.status NOT IN ('paid','payment_pending')",
+                """
+                NOT EXISTS (
+                    SELECT 1
+                    FROM invoices dup
+                    WHERE dup.id <> i.id
+                      AND lower(coalesce(dup.invoice_number, '')) = lower(coalesce(i.invoice_number, ''))
+                      AND abs(coalesce(dup.total_amount, 0) - coalesce(i.total_amount, 0)) <= 0.01
+                      AND (
+                        (i.vendor_id IS NOT NULL AND dup.vendor_id = i.vendor_id)
+                        OR (
+                            i.vendor_id IS NULL
+                            AND dup.vendor_id IS NULL
+                            AND lower(coalesce(dup.supplier_name, '')) = lower(coalesce(i.supplier_name, ''))
+                        )
+                      )
+                      AND (
+                        (i.invoice_date IS NULL AND dup.invoice_date IS NULL)
+                        OR dup.invoice_date = i.invoice_date
+                      )
+                      AND (
+                        dup.created_at < i.created_at
+                        OR (dup.created_at = i.created_at AND dup.id::text < i.id::text)
+                      )
+                )
+                """,
+            ]
             params: list[Any] = []
             if vendor_id:
                 where.append("i.vendor_id = %s")

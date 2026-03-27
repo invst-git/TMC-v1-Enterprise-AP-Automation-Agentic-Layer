@@ -3,6 +3,46 @@
 
 const API_BASE_URL = process.env.REACT_APP_API_URL || '/api';
 
+const mapApiErrorMessage = (message) => {
+  const lowered = String(message || '').toLowerCase();
+
+  if (!lowered) return 'We could not complete that request. Please try again.';
+  if (lowered.includes('failed to fetch') || lowered.includes('networkerror')) {
+    return 'The app cannot reach the server right now. Please check the connection and try again.';
+  }
+  if (lowered.includes('duplicate invoice')) {
+    return 'This invoice was already received earlier, so it was blocked to prevent duplicate payment.';
+  }
+  if (lowered.includes('duplicate payment')) {
+    return 'A duplicate invoice was detected in this payment request, so the payment was blocked for safety.';
+  }
+  if (lowered.includes('already paid')) {
+    return 'This invoice has already been paid.';
+  }
+  if (lowered.includes('already pending')) {
+    return 'This invoice is already in an active payment flow.';
+  }
+  if (lowered.includes('mixed currency')) {
+    return 'Invoices with different currencies cannot be paid together.';
+  }
+  if (lowered.includes('not ready to be paid') || lowered.includes('not eligible for payment')) {
+    return 'This invoice is not ready to be paid yet.';
+  }
+  if (lowered.includes('not found')) {
+    return 'The requested record could not be found.';
+  }
+  return String(message || 'We could not complete that request. Please try again.');
+};
+
+const nativeFetch = (...args) => window.fetch(...args);
+const fetch = async (...args) => {
+  try {
+    return await nativeFetch(...args);
+  } catch (error) {
+    throw new Error(mapApiErrorMessage(error?.message || error));
+  }
+};
+
 // Helper function to handle API responses
 const handleResponse = async (response) => {
   if (!response.ok) {
@@ -10,14 +50,62 @@ const handleResponse = async (response) => {
     const contentType = response.headers.get('content-type') || '';
     if (contentType.includes('application/json')) {
       const error = await response.json().catch(() => ({ message: 'An error occurred' }));
-      throw new Error(error.error || error.message || `HTTP error! status: ${response.status}`);
+      throw new Error(mapApiErrorMessage(error.error || error.message || `HTTP error! status: ${response.status}`));
     }
     const text = await response.text().catch(() => 'An error occurred');
-    throw new Error(text || `HTTP error! status: ${response.status}`);
+    throw new Error(mapApiErrorMessage(text || `HTTP error! status: ${response.status}`));
   }
   const contentType = response.headers.get('content-type') || '';
   if (contentType.includes('application/json')) return response.json();
   return response.text();
+};
+
+export const subscribeToLiveUpdates = ({
+  onOpen,
+  onChange,
+  onHeartbeat,
+  onError,
+} = {}) => {
+  if (typeof window === 'undefined' || typeof window.EventSource === 'undefined') {
+    const intervalId = window.setInterval(() => {
+      if (typeof onHeartbeat === 'function') {
+        onHeartbeat({ eventType: 'heartbeat', serverTime: new Date().toISOString() });
+      }
+    }, 1000);
+    return {
+      close() {
+        window.clearInterval(intervalId);
+      },
+    };
+  }
+
+  const source = new window.EventSource(`${API_BASE_URL}/live/stream`);
+  const parsePayload = (event) => {
+    try {
+      return JSON.parse(event.data);
+    } catch (_) {
+      return { eventType: 'unknown', serverTime: new Date().toISOString() };
+    }
+  };
+
+  source.addEventListener('ready', (event) => {
+    if (typeof onOpen === 'function') onOpen(parsePayload(event));
+  });
+  source.addEventListener('change', (event) => {
+    if (typeof onChange === 'function') onChange(parsePayload(event));
+  });
+  source.addEventListener('heartbeat', (event) => {
+    if (typeof onHeartbeat === 'function') onHeartbeat(parsePayload(event));
+  });
+  source.onerror = (event) => {
+    if (typeof onError === 'function') onError(event);
+  };
+
+  return {
+    close() {
+      source.close();
+    },
+  };
 };
 
 // Extract <pre>...</pre> content from HTML returned by Flask templates
@@ -513,7 +601,11 @@ export const getStatusLabel = (status) => {
     'matched_auto': 'Matched',
     'unmatched': 'Unmatched',
     'vendor_mismatch': 'Mismatch',
-    'needs_review': 'Needs Review'
+    'needs_review': 'Needs Review',
+    'ready_for_payment': 'Ready for Payment',
+    'payment_pending': 'Payment Pending',
+    'paid': 'Paid',
+    'duplicate_blocked': 'Duplicate Blocked'
   };
   return labels[status] || status;
 };

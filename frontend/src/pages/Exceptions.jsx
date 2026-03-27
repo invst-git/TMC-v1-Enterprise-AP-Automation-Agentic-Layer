@@ -1,7 +1,8 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import Sidebar from '../components/Sidebar';
 import { fetchExceptionInvoices, fetchVendors, getStatusLabel, formatCurrency } from '../services/api';
 import InvoiceDetailModal from '../components/InvoiceDetailModal';
+import { useLiveRefresh } from '../lib/useLiveRefresh';
 
 const Exceptions = () => {
   const [activeNav] = useState('exceptions');
@@ -26,7 +27,9 @@ const Exceptions = () => {
 
   const load = async () => {
     try {
-      setLoading(true);
+      if (!items.length && !vendors.length) {
+        setLoading(true);
+      }
       const [vData, exData] = await Promise.all([
         fetchVendors(),
         fetchExceptionInvoices({ vendorId: selectedVendorId || undefined, status: statusFilter || undefined, limit: 200 })
@@ -41,10 +44,7 @@ const Exceptions = () => {
     }
   };
 
-  useEffect(() => {
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedVendorId, statusFilter]);
+  const liveState = useLiveRefresh(load, [selectedVendorId, statusFilter]);
 
   const openInvoice = (inv) => {
     setSelectedInvoice(inv);
@@ -56,7 +56,12 @@ const Exceptions = () => {
 
       <div className="lg:ml-[220px] p-4 sm:p-6 lg:p-8 transition-all">
         <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-6">
-          <h1 className="text-2xl sm:text-3xl font-semibold text-black">Exceptions</h1>
+          <div className="flex items-center gap-3">
+            <h1 className="text-2xl sm:text-3xl font-semibold text-black">Exceptions</h1>
+            <span className={`rounded-full px-2 py-1 text-[11px] font-medium ${liveState.connected ? 'bg-green-50 text-green-700 border border-green-200' : 'bg-amber-50 text-amber-700 border border-amber-200'}`}>
+              {liveState.connected ? 'Live' : 'Reconnecting'}
+            </span>
+          </div>
           <div className="flex items-center gap-3 w-full sm:w-auto">
             <select
               className="border border-gray-200 rounded-lg text-sm px-3 py-2"

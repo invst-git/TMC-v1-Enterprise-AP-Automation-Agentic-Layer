@@ -1,8 +1,9 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import Sidebar from '../components/Sidebar';
 import { fetchPayableInvoices, fetchVendors, formatCurrency, getStatusLabel, createPaymentIntent, confirmPayment, cancelPayment } from '../services/api';
 import { loadStripe } from '@stripe/stripe-js';
 import { Elements, CardElement, useElements, useStripe } from '@stripe/react-stripe-js';
+import { useLiveRefresh } from '../lib/useLiveRefresh';
 
 const stripePromise = loadStripe(process.env.REACT_APP_STRIPE_PUBLISHABLE_KEY || '');
 
@@ -133,13 +134,23 @@ const Payments = () => {
 
   const load = async () => {
     try {
-      setLoading(true);
+      if (!items.length && !vendors.length) {
+        setLoading(true);
+      }
       const [vData, invData] = await Promise.all([
         fetchVendors(),
         fetchPayableInvoices({ vendorId: selectedVendorId || undefined, currency: currency || undefined, limit: 200 })
       ]);
       setVendors(vData);
       setItems(invData);
+      setSelected((current) => {
+        const next = { ...current };
+        const allowed = new Set(invData.map((item) => item.id));
+        Object.keys(next).forEach((id) => {
+          if (!allowed.has(id)) delete next[id];
+        });
+        return next;
+      });
       setError(null);
     } catch (e) {
       setError(e.message);
@@ -148,8 +159,7 @@ const Payments = () => {
     }
   };
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { load(); }, [selectedVendorId, currency]);
+  const liveState = useLiveRefresh(load, [selectedVendorId, currency]);
 
   const toggle = (id) => setSelected(s => ({ ...s, [id]: !s[id] }));
   const selectAllForVendor = (vendorId, check) => {
@@ -167,7 +177,12 @@ const Payments = () => {
 
       <div className="lg:ml-[220px] p-4 sm:p-6 lg:p-8 transition-all">
         <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-6">
-          <h1 className="text-2xl sm:text-3xl font-semibold text-black">Payments</h1>
+          <div className="flex items-center gap-3">
+            <h1 className="text-2xl sm:text-3xl font-semibold text-black">Payments</h1>
+            <span className={`rounded-full px-2 py-1 text-[11px] font-medium ${liveState.connected ? 'bg-green-50 text-green-700 border border-green-200' : 'bg-amber-50 text-amber-700 border border-amber-200'}`}>
+              {liveState.connected ? 'Live' : 'Reconnecting'}
+            </span>
+          </div>
           <div className="flex items-center gap-3 w-full sm:w-auto">
             <select className="border border-gray-200 rounded-lg text-sm px-3 py-2" value={selectedVendorId} onChange={e => setSelectedVendorId(e.target.value)}>
               <option value="">All vendors</option>

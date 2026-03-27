@@ -16,6 +16,7 @@ from po_db import get_po_by_id as get_po_detail
 from document_pipeline import process_saved_invoice_file
 from ingress_tracking import register_ingress_source_document_best_effort
 from agent_worker import start_agent_worker_thread
+from realtime_events import publish_live_update, stream_live_updates
 from agent_db import (
     get_agent_operations_overview,
     get_source_document_detail,
@@ -44,6 +45,7 @@ from payment_authorization import (
     reject_payment_authorization,
     request_payment_authorization,
 )
+from user_facing_errors import get_error_details, get_user_facing_message
 
 load_dotenv()
 
@@ -79,22 +81,22 @@ def _agent_api_response(loader, *, not_found_message=None):
         if payload is None and not_found_message:
             return jsonify({"error": not_found_message}), 404
         return jsonify(payload)
-    except RuntimeError as e:
-        return jsonify({"error": str(e)}), 503
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e, default_status=503 if isinstance(e, RuntimeError) else 500)
 
 
 def _agent_mutation_response(loader, *, created=False):
     try:
         payload=loader()
         return jsonify(payload), (201 if created else 200)
-    except RuntimeError as e:
-        return jsonify({"error": str(e)}), 503
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        default_status = 503 if isinstance(e, RuntimeError) else 400 if isinstance(e, ValueError) else 500
+        return _error_response(e, default_status=default_status)
+
+
+def _error_response(exc, *, default_status=500):
+    details = get_error_details(exc, default_status=default_status)
+    return jsonify({"error": details.message, "errorCode": details.code}), details.status_code
 
 INDEX_TEMPLATE="""
 <!doctype html>
@@ -196,6 +198,7 @@ def run_job(triggered_by="scheduler"):
         if is_running:
             return
         is_running=True
+    publish_live_update("intake.run_started", {"triggeredBy": triggered_by})
     try:
         last_run_at=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         logs=fetch_and_process_invoices()
@@ -204,9 +207,17 @@ def run_job(triggered_by="scheduler"):
         else:
             last_run_result=str(logs)
     except Exception as e:
-        last_run_result=f"Unexpected error in job: {e}"
+        last_run_result=get_user_facing_message(e)
     finally:
         is_running=False
+        publish_live_update(
+            "intake.run_finished",
+            {
+                "triggeredBy": triggered_by,
+                "lastRunAt": last_run_at,
+                "isRunning": is_running,
+            },
+        )
 
 @app.route("/",methods=["GET"])
 def index():
@@ -236,7 +247,18 @@ def api_run_status():
             "intervalSeconds": CHECK_INTERVAL_SECONDS,
         })
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
+
+
+@app.route("/api/live/stream", methods=["GET"])
+def api_live_stream():
+    headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return Response(stream_with_context(stream_live_updates(heartbeat_seconds=1.0)), headers=headers)
 
 @app.route("/upload",methods=["GET","POST"])
 def upload_page():
@@ -285,10 +307,17 @@ def upload_page():
                         source_document_id=source_document["id"] if source_document else None,
                     )
                     logs.extend(result.get("logs") or [])
+                    publish_live_update(
+                        "invoice.upload_processed",
+                        {
+                            "sourceDocumentId": source_document["id"] if source_document else None,
+                            "invoiceIds": result.get("invoice_ids") or [],
+                        },
+                    )
                 else:
-                    logs.append("Upload treated as duplicate; file already exists")
+                    logs.append("This exact file was already uploaded earlier, so it was not processed again.")
             except Exception as e:
-                logs.append(f"Error processing upload: {e}")
+                logs.append(get_user_facing_message(e))
     logs_text="\n".join(logs) if logs else ""
     return render_template_string(
         UPLOAD_TEMPLATE,
@@ -306,7 +335,7 @@ def api_dashboard_stats():
         stats = get_dashboard_stats(30)
         return jsonify(stats)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 @app.route("/api/dashboard/graph-data",methods=["GET"])
 def api_graph_data():
@@ -315,7 +344,7 @@ def api_graph_data():
         data = get_graph_data(30)
         return jsonify(data)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 @app.route("/api/invoices/recent",methods=["GET"])
 def api_recent_invoices():
@@ -325,7 +354,7 @@ def api_recent_invoices():
         invoices = get_recent_invoices(limit)
         return jsonify(invoices)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 @app.route("/api/invoices/<invoice_id>",methods=["GET"])
 def api_invoice_detail(invoice_id):
@@ -337,7 +366,7 @@ def api_invoice_detail(invoice_id):
         else:
             return jsonify({"error": "Invoice not found"}), 404
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 @app.route("/api/agent/overview", methods=["GET"])
@@ -606,7 +635,7 @@ def api_vendors_list():
         vendors = get_all_vendors_detailed()
         return jsonify(vendors)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 @app.route("/api/vendors/stats",methods=["GET"])
 def api_vendor_stats():
@@ -615,7 +644,7 @@ def api_vendor_stats():
         stats = get_vendor_stats()
         return jsonify(stats)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 @app.route("/api/vendors/<vendor_id>",methods=["GET"])
 def api_vendor_detail(vendor_id):
@@ -627,7 +656,7 @@ def api_vendor_detail(vendor_id):
         else:
             return jsonify({"error": "Vendor not found"}), 404
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 @app.route("/api/vendors", methods=["POST"])
 def api_vendor_create():
@@ -641,18 +670,20 @@ def api_vendor_create():
         if not name:
             return jsonify({"error": "name is required"}), 400
         vendor = create_vendor(name=name, tax_id=tax_id, contact_info=contact, address=address)
+        publish_live_update("vendor.created", {"vendorId": str(vendor.get("id")) if isinstance(vendor, dict) else None})
         return jsonify(vendor), 201
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return _error_response(e, default_status=400)
 
 @app.route("/api/vendors/<vendor_id>", methods=["DELETE"])
 def api_vendor_delete(vendor_id):
     """Delete a vendor and related records."""
     try:
         summary = delete_vendor(vendor_id)
+        publish_live_update("vendor.deleted", {"vendorId": vendor_id})
         return jsonify({"deleted": summary})
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return _error_response(e, default_status=400)
 
 # Mentions (typeahead for @)
 @app.route("/api/vendors/<vendor_id>/mentions", methods=["GET"])
@@ -1035,7 +1066,7 @@ def api_exception_invoices():
         items = get_exception_invoices(vendor_id=vendor_id, limit=limit, status=status)
         return jsonify(items)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 # Purchase Order API Route
 @app.route("/api/purchase-orders/<po_id>", methods=["GET"])
@@ -1048,7 +1079,7 @@ def api_purchase_order_detail(po_id):
         else:
             return jsonify({"error": "Purchase order not found"}), 404
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 # Payable invoices
 @app.route("/api/invoices/payable", methods=["GET"])
@@ -1060,7 +1091,7 @@ def api_invoices_payable():
         items = get_payable_invoices(vendor_id=vendor_id, currency=currency, limit=limit)
         return jsonify(items)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 # Create PaymentIntent
 @app.route("/api/payments/create-intent", methods=["POST"])
@@ -1074,7 +1105,7 @@ def api_create_payment_intent():
         result = create_payment_intent_for_invoices(invoice_ids, customer, currency, save_method)
         return jsonify(result)
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return _error_response(e, default_status=400)
 
 @app.route("/api/payments/confirm", methods=["POST"])
 def api_confirm_payment():
@@ -1089,7 +1120,7 @@ def api_confirm_payment():
         result = confirm_payment_intent(pi_id)
         return jsonify(result)
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return _error_response(e, default_status=400)
 
 @app.route("/api/payments/cancel", methods=["POST"])
 def api_cancel_payment():
@@ -1102,7 +1133,7 @@ def api_cancel_payment():
         mark_payment_failed_or_canceled(pi_id)
         return jsonify({"status": "reverted"})
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return _error_response(e, default_status=400)
 
 def start_scheduler():
     scheduler=BackgroundScheduler(daemon=True)

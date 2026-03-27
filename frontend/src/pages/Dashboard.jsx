@@ -1,7 +1,8 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import Sidebar from '../components/Sidebar';
 import LineChart from '../components/LineChart';
 import InvoiceDetailModal from '../components/InvoiceDetailModal';
+import { useLiveRefresh } from '../lib/useLiveRefresh';
 import {
   fetchDashboardStats,
   fetchGraphData,
@@ -47,53 +48,37 @@ const Dashboard = () => {
   const [selectedVendorId, setSelectedVendorId] = useState('');
   const [selectedFile, setSelectedFile] = useState(null);
 
-  // Fetch data on component mount
-  useEffect(() => {
-    const loadDashboardData = async () => {
-      try {
+  const loadDashboardData = async () => {
+    try {
+      if (!graphData.length && !recentInvoices.length && !vendors.length) {
         setLoading(true);
-        const [statsData, graphDataResponse, invoicesData, vendorsData] = await Promise.all([
-          fetchDashboardStats(),
-          fetchGraphData(),
-          fetchRecentInvoices(8),
-          fetchVendors()
-        ]);
-
-        setStats(statsData);
-        setGraphData(graphDataResponse);
-        setRecentInvoices(invoicesData);
-        setVendors(vendorsData);
-        setError(null);
-      } catch (err) {
-        console.error('Error loading dashboard data:', err);
-        setError(err.message);
-      } finally {
-        setLoading(false);
       }
-    };
-
-    loadDashboardData();
-  }, []);
+      const [statsData, graphDataResponse, invoicesData, vendorsData] = await Promise.all([
+        fetchDashboardStats(),
+        fetchGraphData(),
+        fetchRecentInvoices(8),
+        fetchVendors()
+      ]);
+      setStats(statsData);
+      setGraphData(graphDataResponse);
+      setRecentInvoices(invoicesData);
+      setVendors(vendorsData);
+      setError(null);
+    } catch (err) {
+      console.error('Error refreshing dashboard data:', err);
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+  const liveState = useLiveRefresh(loadDashboardData, []);
 
   const handleInvoiceClick = (invoice) => {
     setSelectedInvoice(invoice);
     setModalOpen(true);
   };
 
-  const refreshData = async () => {
-    try {
-      const [statsData, graphDataResponse, invoicesData] = await Promise.all([
-        fetchDashboardStats(),
-        fetchGraphData(),
-        fetchRecentInvoices(8)
-      ]);
-      setStats(statsData);
-      setGraphData(graphDataResponse);
-      setRecentInvoices(invoicesData);
-    } catch (err) {
-      console.error('Error refreshing dashboard data:', err);
-    }
-  };
+  const refreshData = loadDashboardData;
 
   const handleRunNow = async () => {
     try {
@@ -136,6 +121,14 @@ const Dashboard = () => {
         return 'bg-gray-100 text-black border-gray-400';
       case 'needs_review':
         return 'bg-gray-200 text-black border-gray-500';
+      case 'ready_for_payment':
+        return 'bg-blue-50 text-blue-800 border-blue-200';
+      case 'payment_pending':
+        return 'bg-amber-50 text-amber-800 border-amber-200';
+      case 'paid':
+        return 'bg-green-50 text-green-800 border-green-200';
+      case 'duplicate_blocked':
+        return 'bg-red-50 text-red-700 border-red-200';
       default:
         return 'bg-white text-black border-gray-300';
     }
@@ -150,7 +143,12 @@ const Dashboard = () => {
         {/* Page Header + Actions */}
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-6">
           <div className="flex items-center justify-between">
-            <h1 className="text-2xl sm:text-3xl font-semibold text-black">Dashboard</h1>
+            <div className="flex items-center gap-3">
+              <h1 className="text-2xl sm:text-3xl font-semibold text-black">Dashboard</h1>
+              <span className={`hidden sm:inline rounded-full px-2 py-1 text-[11px] font-medium ${liveState.connected ? 'bg-green-50 text-green-700 border border-green-200' : 'bg-amber-50 text-amber-700 border border-amber-200'}`}>
+                {liveState.connected ? 'Live' : 'Reconnecting'}
+              </span>
+            </div>
             <span className="ml-3 text-xs sm:text-sm text-gray-500 hidden sm:inline">Last 30 days</span>
           </div>
           <div className="flex gap-2">

@@ -10,6 +10,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '../components/
 import { Input } from '../components/ui/input';
 import { formatNumber, fetchVendors, fetchVendorStats, fetchVendorById, fetchInvoiceById, fetchPurchaseOrderById, createVendor, deleteVendor } from '../services/api';
 import VendorChat from '../components/VendorChat';
+import { useLiveRefresh } from '../lib/useLiveRefresh';
 
 const Vendors = () => {
   const [activeNav] = useState('vendors');
@@ -34,42 +35,32 @@ const Vendors = () => {
   const [newVendor, setNewVendor] = useState({ name: '', taxId: '', contact: '', address: '' });
   const [chatOpen, setChatOpen] = useState(false);
 
-  // Fetch vendors and stats on mount
-  useEffect(() => {
-    const loadVendorData = async () => {
-      try {
-        setLoading(true);
-        const [vendorsData, statsData] = await Promise.all([
-          fetchVendors(),
-          fetchVendorStats()
-        ]);
-
-        setVendors(vendorsData);
-        setStats(statsData);
-        setError(null);
-      } catch (err) {
-        console.error('Error loading vendor data:', err);
-        setError(err.message);
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    loadVendorData();
-  }, []);
-
   const refreshVendors = async () => {
     try {
+      if (!vendors.length) {
+        setLoading(true);
+      }
       const [vendorsData, statsData] = await Promise.all([
         fetchVendors(),
         fetchVendorStats()
       ]);
       setVendors(vendorsData);
       setStats(statsData);
+      if (selectedVendor?.id) {
+        try {
+          const details = await fetchVendorById(selectedVendor.id);
+          setSelectedVendorDetails(details);
+        } catch (_) {
+        }
+      }
+      setError(null);
     } catch (err) {
-      // no-op
+      setError(err.message);
+    } finally {
+      setLoading(false);
     }
   };
+  const liveState = useLiveRefresh(refreshVendors, [selectedVendor?.id || '']);
 
   // Listen for 'open-invoice' events from VendorDetailPanel (to open modal)
   useEffect(() => {
@@ -139,9 +130,14 @@ const Vendors = () => {
       <div className="lg:ml-[220px] p-4 sm:p-6 lg:p-8 transition-all">
         {/* Page Header */}
         <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-6">
-          <h1 className="text-2xl sm:text-3xl font-semibold text-black">
-            Vendors
-          </h1>
+          <div className="flex items-center gap-3">
+            <h1 className="text-2xl sm:text-3xl font-semibold text-black">
+              Vendors
+            </h1>
+            <span className={`rounded-full px-2 py-1 text-[11px] font-medium ${liveState.connected ? 'bg-green-50 text-green-700 border border-green-200' : 'bg-amber-50 text-amber-700 border border-amber-200'}`}>
+              {liveState.connected ? 'Live' : 'Reconnecting'}
+            </span>
+          </div>
 
           {/* Search and Add Button */}
           <div className="flex items-center gap-3 w-full sm:w-auto">
