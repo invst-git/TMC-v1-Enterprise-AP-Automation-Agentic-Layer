@@ -1,0 +1,10 @@
+flask
+python-dotenv
+apscheduler
+landingai-ade
+pypdf
+pydantic
+psycopg[binary]
+stripe
+google-generativeai
+anthropic
