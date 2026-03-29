@@ -144,6 +144,7 @@ This is the structured result after OCR and document extraction. The application
 ### AgentOps Dashboard
 A dashboard to track Agent Activity, Agent Health, Invoice Processing Metrics and SLA Health
 
+![AgentOps](https://github.com/user-attachments/assets/3b5fdaf3-9757-464e-bcd9-7601f41c890e)
 
 ### Chat Interface
 
@@ -156,7 +157,11 @@ The vendor-specific chat interface provides a scoped assistant for working with 
 The exceptions page groups invoices that could not be processed cleanly. These are the records most likely to require operator review or vendor clarification.
 
 <img width="1919" height="971" alt="Image" src="https://github.com/user-attachments/assets/9492062b-67a6-44dc-afe7-55dd61c77803" />
+### Review Queue
 
+Invoices that are did not meet confidence threshold or those that met partial threshold are sent to review queqe with explanation as to why they are marked as "Needs to be Reviewed".
+![ReviewQueue](https://github.com/user-attachments/assets/7999c79c-65eb-4be5-8b4f-457af5ff5c40)
+![Review-detailed](https://github.com/user-attachments/assets/c5d005d4-2a41-4b01-8feb-33a68e6ebdf3)
 
 
 ### Payments
