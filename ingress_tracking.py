@@ -3,6 +3,7 @@ import mimetypes
 import os
 from typing import Any, Dict, Optional, Tuple
 
+from workflow_task_queue import get_task_max_attempts
 
 def _get_agent_db_ops():
     from agent_db import enqueue_agent_task, record_source_document, set_workflow_state
@@ -112,6 +113,7 @@ def register_ingress_source_document(
         entity_id=source_document["id"],
         source_document_id=source_document["id"],
         priority=50,
+        max_attempts=get_task_max_attempts("intake.classify"),
         dedupe_key=f"source_document:{source_document['id']}:intake.classify",
         payload={
             "source_document_id": source_document["id"],

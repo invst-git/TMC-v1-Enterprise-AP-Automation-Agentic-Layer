@@ -133,3 +133,92 @@ def update_source_document_segment_best_effort(
         )
     except Exception as exc:
         return None, str(exc)
+
+
+def finalize_source_document_extraction_from_segments(
+    source_document_id: str,
+) -> Optional[str]:
+    from agent_db import get_source_document_detail, set_workflow_state, update_source_document
+
+    detail = get_source_document_detail(source_document_id)
+    if not detail:
+        return None
+
+    segments = detail.get("segments") or []
+    if not segments:
+        return None
+
+    segment_statuses = [str(segment.get("status") or "").strip().lower() for segment in segments]
+    pending_statuses = {"created", "ready", "queued", "extracting", "matching_queued"}
+    if any(status in pending_statuses for status in segment_statuses):
+        update_source_document(
+            source_document_id,
+            extraction_status="extracting",
+            metadata={
+                "extraction": {
+                    "segment_statuses": segment_statuses,
+                    "pending_segment_count": sum(1 for status in segment_statuses if status in pending_statuses),
+                }
+            },
+        )
+        return "extracting"
+
+    success_statuses = {"validated", "persisted", "duplicate_blocked", "matched", "matched_auto"}
+    failed_statuses = {"failed"}
+    review_statuses = {"review_required", "needs_review", "matching_failed"}
+
+    success_count = sum(1 for status in segment_statuses if status in success_statuses)
+    failed_count = sum(1 for status in segment_statuses if status in failed_statuses)
+    review_count = sum(1 for status in segment_statuses if status in review_statuses)
+
+    if success_count == 0 and failed_count > 0 and review_count == 0:
+        extraction_status = "failed"
+        workflow_state = "extraction_failed"
+        reason = "All source document segments failed before a validated extraction could be persisted."
+    elif review_count > 0 or failed_count > 0:
+        extraction_status = "review_required"
+        workflow_state = "needs_review"
+        reason = "One or more source document segments still require human review after automated extraction."
+    else:
+        extraction_status = "validated"
+        workflow_state = "validated"
+        reason = "All source document segments completed automated extraction successfully."
+
+    update_source_document(
+        source_document_id,
+        extraction_status=extraction_status,
+        metadata={
+            "extraction": {
+                "segment_statuses": segment_statuses,
+                "successful_segments": success_count,
+                "review_required_segments": review_count,
+                "failed_segments": failed_count,
+            }
+        },
+    )
+    set_workflow_state(
+        "source_document",
+        source_document_id,
+        workflow_state,
+        current_stage="extraction",
+        event_type="extraction_completed",
+        reason=reason,
+        metadata={
+            "source_document_id": source_document_id,
+            "successful_segments": success_count,
+            "review_required_segments": review_count,
+            "failed_segments": failed_count,
+        },
+    )
+    return extraction_status
+
+
+def finalize_source_document_extraction_from_segments_best_effort(
+    source_document_id: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    if not source_document_id:
+        return None, None
+    try:
+        return finalize_source_document_extraction_from_segments(source_document_id), None
+    except Exception as exc:
+        return None, str(exc)

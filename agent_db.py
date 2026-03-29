@@ -19,6 +19,7 @@ _AGENT_TABLES = (
 )
 
 _AGENT_MIGRATION = "migrations/2026-03-27_add_agentic_workflow_backbone.sql"
+_SLA_RUNTIME_MIGRATION = "migrations/2026-03-29_add_sla_runtime_fields.sql"
 
 
 def _assert_agent_tables(cur) -> None:
@@ -48,6 +49,38 @@ def _assert_agent_tables(cur) -> None:
         raise RuntimeError(
             "Agent workflow tables not found. "
             f"Run migration: {_AGENT_MIGRATION}. Missing: {', '.join(missing)}"
+        )
+    cur.execute(
+        """
+        SELECT
+          EXISTS(
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'workflow_states'
+              AND column_name = 'breach_risk'
+          ),
+          EXISTS(
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'sla_configs'
+              AND column_name = 'warning_minutes'
+          ),
+          EXISTS(
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'sla_configs'
+              AND column_name = 'breach_minutes'
+          )
+        """
+    )
+    runtime_columns = cur.fetchone()
+    if not runtime_columns or not all(bool(value) for value in runtime_columns):
+        raise RuntimeError(
+            "Agent SLA runtime columns not found. "
+            f"Run migration: {_SLA_RUNTIME_MIGRATION}."
         )
 
 
@@ -122,9 +155,10 @@ def _workflow_state_row(row: Any, previous_state: Optional[str] = None) -> Dict[
         "current_state": row[3],
         "current_stage": row[4],
         "confidence": float(row[5]) if row[5] is not None else None,
-        "metadata": _json_value(row[6], {}),
-        "created_at": _iso(row[7]),
-        "updated_at": _iso(row[8]),
+        "breach_risk": row[6] or "ok",
+        "metadata": _json_value(row[7], {}),
+        "created_at": _iso(row[8]),
+        "updated_at": _iso(row[9]),
         "previous_state": previous_state,
     }
 
@@ -214,6 +248,155 @@ def _human_review_row(row: Any) -> Dict[str, Any]:
     }
 
 
+def _review_status_display(status: Optional[str]) -> str:
+    lowered = str(status or "").strip().lower()
+    if lowered == "open":
+        return "pending"
+    if lowered == "assigned":
+        return "in_review"
+    return lowered or "pending"
+
+
+def _review_reason_label(review_reason: Optional[str]) -> str:
+    mapping = {
+        "missing_po_number": "Missing PO Number",
+        "no_open_po_candidates": "No Open PO Candidate",
+        "amount_outside_tolerance": "Amount Outside Tolerance",
+        "candidate_missing_po_total": "PO Total Missing",
+        "vendor_mismatch": "Vendor Mismatch",
+        "candidate_vendor_mismatch": "Vendor Candidate Mismatch",
+        "candidate_vendor_and_currency_mismatch": "Vendor and Currency Mismatch",
+        "candidate_currency_mismatch": "Currency Mismatch",
+        "missing_invoice_total": "Missing Invoice Total",
+        "potential_duplicate_invoice": "Potential Duplicate Invoice",
+        "approval_required": "Approval Required",
+        "ocr_extraction_failed": "OCR Extraction Failed",
+        "ocr_output_unreadable": "OCR Output Unreadable",
+        "needs_clarification": "Needs Clarification",
+    }
+    key = str(review_reason or "").strip()
+    if key in mapping:
+        return mapping[key]
+    if not key:
+        return "Needs Review"
+    return " ".join(part.capitalize() for part in key.replace("-", "_").split("_"))
+
+
+def _load_invoice_summaries(invoice_ids: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+    normalized_invoice_ids = [str(invoice_id) for invoice_id in invoice_ids if invoice_id]
+    if not normalized_invoice_ids:
+        return {}
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  i.id,
+                  i.invoice_number,
+                  i.invoice_date,
+                  i.total_amount,
+                  i.status,
+                  i.po_number,
+                  i.currency,
+                  i.supplier_name,
+                  v.name AS vendor_name
+                FROM invoices AS i
+                LEFT JOIN vendors AS v
+                  ON v.id = i.vendor_id
+                WHERE i.id = ANY(%s)
+                """,
+                (normalized_invoice_ids,),
+            )
+            summaries = {}
+            for row in cur.fetchall():
+                invoice_date = row[2]
+                summaries[str(row[0])] = {
+                    "id": str(row[0]),
+                    "invoice_number": row[1] or "",
+                    "invoice_date": invoice_date.isoformat() if invoice_date else None,
+                    "total_amount": float(row[3]) if row[3] is not None else None,
+                    "status": row[4] or "",
+                    "po_number": row[5] or "",
+                    "currency": row[6] or "USD",
+                    "supplier_name": row[7] or "",
+                    "vendor_name": row[8] or row[7] or "Unknown Vendor",
+                }
+            return summaries
+
+
+def _review_candidate_pos(metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+    candidate_sources = []
+    analysis = metadata.get("analysis") or {}
+    resolution_packet = metadata.get("resolution_packet") or {}
+    candidate_sources.extend(analysis.get("candidates") or [])
+    candidate_sources.extend((resolution_packet.get("initial_analysis") or {}).get("candidates") or [])
+    candidate_sources.extend((resolution_packet.get("final_analysis") or {}).get("candidates") or [])
+
+    normalized = {}
+    for candidate in candidate_sources:
+        po_id = str(candidate.get("po_id") or "")
+        if not po_id:
+            continue
+        existing = normalized.get(po_id)
+        confidence = float(candidate.get("confidence") or 0.0)
+        record = {
+            "po_id": po_id,
+            "po_number": candidate.get("po_number") or "",
+            "total_amount": candidate.get("total_amount"),
+            "currency": candidate.get("currency") or "USD",
+            "vendor_id": candidate.get("vendor_id"),
+            "amount_diff": candidate.get("diff"),
+            "vendor_match": bool(candidate.get("vendor_match")),
+            "currency_match": bool(candidate.get("currency_match")),
+            "within_tolerance": bool(candidate.get("within_tolerance")),
+            "similarity_score": confidence,
+            "eligibility_reason": candidate.get("eligibility_reason") or "",
+        }
+        if existing is None or confidence > float(existing.get("similarity_score") or 0.0):
+            normalized[po_id] = record
+
+    return sorted(
+        normalized.values(),
+        key=lambda item: (-float(item.get("similarity_score") or 0.0), str(item.get("po_number") or "")),
+    )
+
+
+def _enrich_human_review_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    invoice_ids = [item.get("invoice_id") for item in items if item.get("invoice_id")]
+    invoice_summaries = _load_invoice_summaries(invoice_ids)
+
+    enriched_items = []
+    for item in items:
+        metadata = item.get("metadata") or {}
+        resolution_packet = metadata.get("resolution_packet") or {}
+        attempts = resolution_packet.get("attempts") or []
+        recommended_action = (
+            metadata.get("recommended_action")
+            or resolution_packet.get("recommended_action")
+            or metadata.get("summary")
+            or "Review the packet and decide the next step."
+        )
+        candidate_pos = _review_candidate_pos(metadata)
+        enriched = {
+            **item,
+            "display_status": _review_status_display(item.get("status")),
+            "review_reason_label": _review_reason_label(item.get("review_reason")),
+            "invoice_summary": invoice_summaries.get(item.get("invoice_id")),
+            "automated_attempt_count": int(
+                resolution_packet.get("attempt_count")
+                or len(attempts)
+                or 0
+            ),
+            "recommended_action": recommended_action,
+            "resolution_packet": resolution_packet,
+            "candidate_pos": candidate_pos,
+            "is_urgent": int(item.get("priority") or 100) <= 80,
+        }
+        enriched_items.append(enriched)
+    return enriched_items
+
+
 def _vendor_communication_row(row: Any) -> Dict[str, Any]:
     return {
         "id": str(row[0]),
@@ -240,11 +423,13 @@ def _sla_config_row(row: Any) -> Dict[str, Any]:
         "entity_type": row[1],
         "state_name": row[2],
         "target_minutes": row[3],
-        "escalation_queue": row[4],
-        "is_active": bool(row[5]),
-        "metadata": _json_value(row[6], {}),
-        "created_at": _iso(row[7]),
-        "updated_at": _iso(row[8]),
+        "warning_minutes": int(row[4]) if row[4] is not None else None,
+        "breach_minutes": int(row[5]) if row[5] is not None else int(row[3]),
+        "escalation_queue": row[6],
+        "is_active": bool(row[7]),
+        "metadata": _json_value(row[8], {}),
+        "created_at": _iso(row[9]),
+        "updated_at": _iso(row[10]),
     }
 
 
@@ -255,13 +440,17 @@ def _sla_breach_row(row: Any) -> Dict[str, Any]:
         "current_state": row[2],
         "current_stage": row[3],
         "confidence": float(row[4]) if row[4] is not None else None,
-        "workflow_metadata": _json_value(row[5], {}),
-        "state_updated_at": _iso(row[6]),
-        "target_minutes": int(row[7]),
-        "escalation_queue": row[8],
-        "sla_metadata": _json_value(row[9], {}),
-        "age_minutes": float(row[10]),
-        "breach_minutes": float(row[11]),
+        "breach_risk": row[5] or "ok",
+        "workflow_metadata": _json_value(row[6], {}),
+        "state_updated_at": _iso(row[7]),
+        "target_minutes": int(row[8]),
+        "warning_minutes": int(row[9]),
+        "breach_threshold_minutes": int(row[10]),
+        "escalation_queue": row[11],
+        "sla_metadata": _json_value(row[12], {}),
+        "age_minutes": float(row[13]),
+        "warning_delta_minutes": float(row[14]),
+        "breach_delta_minutes": float(row[15]),
     }
 
 
@@ -491,6 +680,7 @@ def set_workflow_state(
     *,
     current_stage: Optional[str] = None,
     confidence: Optional[float] = None,
+    breach_risk: Optional[str] = None,
     event_type: str = "transition",
     reason: Optional[str] = None,
     actor_type: str = "system",
@@ -498,6 +688,7 @@ def set_workflow_state(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     previous_state = None
+    breach_risk_value = (breach_risk or "ok").strip().lower() or "ok"
     with get_conn() as conn:
         with conn.cursor() as cur:
             _assert_agent_tables(cur)
@@ -515,19 +706,20 @@ def set_workflow_state(
             cur.execute(
                 """
                 INSERT INTO workflow_states(
-                  entity_type, entity_id, current_state, current_stage, confidence, metadata
+                  entity_type, entity_id, current_state, current_stage, confidence, breach_risk, metadata
                 )
-                VALUES(%s, %s, %s, %s, %s, %s)
+                VALUES(%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (entity_type, entity_id)
                 DO UPDATE SET
                   current_state = EXCLUDED.current_state,
                   current_stage = EXCLUDED.current_stage,
                   confidence = EXCLUDED.confidence,
+                  breach_risk = EXCLUDED.breach_risk,
                   metadata = COALESCE(workflow_states.metadata, '{}'::jsonb) || EXCLUDED.metadata,
                   updated_at = now()
                 RETURNING
                   id, entity_type, entity_id, current_state, current_stage,
-                  confidence, metadata, created_at, updated_at
+                  confidence, breach_risk, metadata, created_at, updated_at
                 """,
                 (
                     entity_type,
@@ -535,6 +727,7 @@ def set_workflow_state(
                     current_state,
                     current_stage,
                     confidence,
+                    breach_risk_value,
                     _jsonb(metadata, {}),
                 ),
             )
@@ -560,6 +753,144 @@ def set_workflow_state(
                 ),
             )
             return _workflow_state_row(row, previous_state=previous_state)
+
+
+def upsert_workflow_state_snapshot(
+    entity_type: str,
+    entity_id: str,
+    current_state: str,
+    *,
+    current_stage: Optional[str] = None,
+    confidence: Optional[float] = None,
+    breach_risk: str = "ok",
+    metadata: Optional[Dict[str, Any]] = None,
+    state_updated_at: Optional[datetime.datetime] = None,
+) -> Dict[str, Any]:
+    timestamp = state_updated_at
+    breach_risk_value = (breach_risk or "ok").strip().lower() or "ok"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            _assert_agent_tables(cur)
+            cur.execute(
+                """
+                INSERT INTO workflow_states(
+                  entity_type, entity_id, current_state, current_stage,
+                  confidence, breach_risk, metadata, created_at, updated_at
+                )
+                VALUES(%s, %s, %s, %s, %s, %s, %s, COALESCE(%s, now()), COALESCE(%s, now()))
+                ON CONFLICT (entity_type, entity_id)
+                DO UPDATE SET
+                  current_state = EXCLUDED.current_state,
+                  current_stage = COALESCE(EXCLUDED.current_stage, workflow_states.current_stage),
+                  confidence = COALESCE(EXCLUDED.confidence, workflow_states.confidence),
+                  breach_risk = COALESCE(EXCLUDED.breach_risk, workflow_states.breach_risk),
+                  metadata = COALESCE(workflow_states.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+                  updated_at = COALESCE(EXCLUDED.updated_at, workflow_states.updated_at)
+                RETURNING
+                  id, entity_type, entity_id, current_state, current_stage,
+                  confidence, breach_risk, metadata, created_at, updated_at
+                """,
+                (
+                    entity_type,
+                    entity_id,
+                    current_state,
+                    current_stage,
+                    confidence,
+                    breach_risk_value,
+                    _jsonb(metadata, {}),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            return _workflow_state_row(cur.fetchone())
+
+
+def update_workflow_breach_risk(
+    entity_type: str,
+    entity_id: str,
+    breach_risk: str,
+    *,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    breach_risk_value = (breach_risk or "ok").strip().lower() or "ok"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            _assert_agent_tables(cur)
+            cur.execute(
+                """
+                UPDATE workflow_states
+                SET
+                  breach_risk = %s,
+                  metadata = CASE
+                    WHEN %s THEN metadata
+                    ELSE COALESCE(metadata, '{}'::jsonb) || %s
+                  END
+                WHERE entity_type = %s AND entity_id = %s
+                RETURNING
+                  id, entity_type, entity_id, current_state, current_stage,
+                  confidence, breach_risk, metadata, created_at, updated_at
+                """,
+                (
+                    breach_risk_value,
+                    metadata is None,
+                    _jsonb(metadata, {}),
+                    entity_type,
+                    entity_id,
+                ),
+            )
+            row = cur.fetchone()
+            return _workflow_state_row(row) if row else None
+
+
+def record_workflow_history_event(
+    entity_type: str,
+    entity_id: str,
+    *,
+    event_type: str,
+    reason: Optional[str] = None,
+    actor_type: str = "system",
+    actor_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            _assert_agent_tables(cur)
+            cur.execute(
+                """
+                SELECT current_state
+                FROM workflow_states
+                WHERE entity_type = %s AND entity_id = %s
+                """,
+                (entity_type, entity_id),
+            )
+            row = cur.fetchone()
+            current_state = row[0] if row else None
+            if current_state is None:
+                return None
+            cur.execute(
+                """
+                INSERT INTO workflow_state_history(
+                  entity_type, entity_id, from_state, to_state, event_type,
+                  reason, actor_type, actor_id, metadata
+                )
+                VALUES(%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING
+                  id, entity_type, entity_id, from_state, to_state, event_type,
+                  reason, actor_type, actor_id, metadata, created_at
+                """,
+                (
+                    entity_type,
+                    entity_id,
+                    current_state,
+                    current_state,
+                    event_type,
+                    reason,
+                    actor_type,
+                    actor_id,
+                    _jsonb(metadata, {}),
+                ),
+            )
+            return _workflow_history_row(cur.fetchone())
 
 
 def enqueue_agent_task(
@@ -845,6 +1176,118 @@ def fail_task(
             return _task_row(row) if row else None
 
 
+def requeue_agent_task(
+    task_id: str,
+    *,
+    error_message: str,
+    error_details: Optional[Dict[str, Any]] = None,
+    retry_delay_seconds: int = 0,
+) -> Optional[Dict[str, Any]]:
+    retry_delay_seconds = max(0, int(retry_delay_seconds))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            _assert_agent_tables(cur)
+            cur.execute(
+                """
+                UPDATE agent_tasks
+                SET
+                  status = 'queued',
+                  available_at = now() + make_interval(secs => %s),
+                  lease_expires_at = NULL,
+                  locked_by = NULL,
+                  locked_at = NULL,
+                  heartbeat_at = NULL,
+                  last_error = %s,
+                  result = %s,
+                  updated_at = now()
+                WHERE id = %s AND status IN ('leased', 'running')
+                RETURNING
+                  id, task_type, entity_type, entity_id, source_document_id,
+                  priority, status, attempt_count, max_attempts, dedupe_key,
+                  available_at, lease_expires_at, locked_by, locked_at,
+                  heartbeat_at, started_at, completed_at, last_error,
+                  payload, result, created_at, updated_at
+                """,
+                (
+                    retry_delay_seconds,
+                    error_message,
+                    _jsonb(error_details, {}),
+                    task_id,
+                ),
+            )
+            row = cur.fetchone()
+            return _task_row(row) if row else None
+
+
+def dead_letter_agent_task(
+    task_id: str,
+    *,
+    error_message: str,
+    error_details: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            _assert_agent_tables(cur)
+            cur.execute(
+                """
+                UPDATE agent_tasks
+                SET
+                  status = 'dead_letter',
+                  lease_expires_at = NULL,
+                  locked_by = NULL,
+                  locked_at = NULL,
+                  heartbeat_at = NULL,
+                  last_error = %s,
+                  result = %s,
+                  completed_at = now(),
+                  updated_at = now()
+                WHERE id = %s AND status IN ('leased', 'running', 'queued', 'failed')
+                RETURNING
+                  id, task_type, entity_type, entity_id, source_document_id,
+                  priority, status, attempt_count, max_attempts, dedupe_key,
+                  available_at, lease_expires_at, locked_by, locked_at,
+                  heartbeat_at, started_at, completed_at, last_error,
+                  payload, result, created_at, updated_at
+                """,
+                (
+                    error_message,
+                    _jsonb(error_details, {}),
+                    task_id,
+                ),
+            )
+            row = cur.fetchone()
+            return _task_row(row) if row else None
+
+
+def list_stalled_agent_tasks(
+    *,
+    stale_after_seconds: int,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    limit = _coerce_limit(limit)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            _assert_agent_tables(cur)
+            cur.execute(
+                """
+                SELECT
+                  id, task_type, entity_type, entity_id, source_document_id,
+                  priority, status, attempt_count, max_attempts, dedupe_key,
+                  available_at, lease_expires_at, locked_by, locked_at,
+                  heartbeat_at, started_at, completed_at, last_error,
+                  payload, result, created_at, updated_at
+                FROM agent_tasks
+                WHERE status IN ('leased', 'running')
+                  AND COALESCE(heartbeat_at, locked_at, started_at, created_at)
+                        <= now() - make_interval(secs => %s)
+                ORDER BY COALESCE(heartbeat_at, locked_at, started_at, created_at) ASC
+                LIMIT %s
+                """,
+                (int(stale_after_seconds), limit),
+            )
+            return [_task_row(row) for row in cur.fetchall()]
+
+
 def record_agent_decision(
     *,
     task_id: str,
@@ -1007,6 +1450,28 @@ def update_human_review_item(
             return _human_review_row(row) if row else None
 
 
+def get_human_review_item(review_item_id: str) -> Optional[Dict[str, Any]]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            _assert_agent_tables(cur)
+            cur.execute(
+                """
+                SELECT
+                  id, entity_type, entity_id, source_document_id, invoice_id,
+                  queue_name, priority, status, review_reason, assigned_to,
+                  due_at, resolution, metadata, created_at, updated_at, resolved_at
+                FROM human_review_queue
+                WHERE id = %s
+                LIMIT %s
+                """,
+                (review_item_id, 1),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return _enrich_human_review_items([_human_review_row(row)])[0]
+
+
 def record_vendor_communication(
     *,
     direction: str,
@@ -1094,11 +1559,11 @@ def list_vendor_communications(
                   status, recipient, subject, body, approved_by, sent_at,
                   metadata, created_at, updated_at
                 FROM vendor_communications
-                WHERE (%s IS NULL OR status = %s)
-                  AND (%s IS NULL OR direction = %s)
-                  AND (%s IS NULL OR vendor_id = %s)
-                  AND (%s IS NULL OR invoice_id = %s)
-                  AND (%s IS NULL OR source_document_id = %s)
+                WHERE (%s::text IS NULL OR status = %s::text)
+                  AND (%s::text IS NULL OR direction = %s::text)
+                  AND (%s::uuid IS NULL OR vendor_id = %s::uuid)
+                  AND (%s::uuid IS NULL OR invoice_id = %s::uuid)
+                  AND (%s::uuid IS NULL OR source_document_id = %s::uuid)
                 ORDER BY created_at DESC
                 LIMIT %s
                 """,
@@ -1175,34 +1640,44 @@ def upsert_sla_config(
     entity_type: str,
     state_name: str,
     target_minutes: int,
+    warning_minutes: Optional[int] = None,
+    breach_minutes: Optional[int] = None,
     escalation_queue: Optional[str] = None,
     is_active: bool = True,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    target_minutes_value = int(target_minutes)
+    warning_minutes_value = int(warning_minutes) if warning_minutes is not None else max(1, target_minutes_value // 2)
+    breach_minutes_value = int(breach_minutes) if breach_minutes is not None else target_minutes_value
     with get_conn() as conn:
         with conn.cursor() as cur:
             _assert_agent_tables(cur)
             cur.execute(
                 """
                 INSERT INTO sla_configs(
-                  entity_type, state_name, target_minutes, escalation_queue, is_active, metadata
+                  entity_type, state_name, target_minutes, warning_minutes, breach_minutes,
+                  escalation_queue, is_active, metadata
                 )
-                VALUES(%s, %s, %s, %s, %s, %s)
+                VALUES(%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (entity_type, state_name)
                 DO UPDATE SET
                   target_minutes = EXCLUDED.target_minutes,
+                  warning_minutes = EXCLUDED.warning_minutes,
+                  breach_minutes = EXCLUDED.breach_minutes,
                   escalation_queue = EXCLUDED.escalation_queue,
                   is_active = EXCLUDED.is_active,
                   metadata = COALESCE(sla_configs.metadata, '{}'::jsonb) || EXCLUDED.metadata,
                   updated_at = now()
                 RETURNING
-                  id, entity_type, state_name, target_minutes, escalation_queue,
-                  is_active, metadata, created_at, updated_at
+                  id, entity_type, state_name, target_minutes, warning_minutes, breach_minutes,
+                  escalation_queue, is_active, metadata, created_at, updated_at
                 """,
                 (
                     entity_type,
                     state_name,
-                    int(target_minutes),
+                    target_minutes_value,
+                    warning_minutes_value,
+                    breach_minutes_value,
                     escalation_queue,
                     is_active,
                     _jsonb(metadata, {}),
@@ -1232,11 +1707,11 @@ def list_source_documents(
                   email_message_id, vendor_id, ingestion_status, segmentation_status,
                   extraction_status, metadata, received_at, created_at, updated_at
                 FROM source_documents
-                WHERE (%s IS NULL OR ingestion_status = %s)
-                  AND (%s IS NULL OR segmentation_status = %s)
-                  AND (%s IS NULL OR extraction_status = %s)
-                  AND (%s IS NULL OR vendor_id = %s)
-                  AND (%s IS NULL OR source_type = %s)
+                WHERE (%s::text IS NULL OR ingestion_status = %s::text)
+                  AND (%s::text IS NULL OR segmentation_status = %s::text)
+                  AND (%s::text IS NULL OR extraction_status = %s::text)
+                  AND (%s::uuid IS NULL OR vendor_id = %s::uuid)
+                  AND (%s::text IS NULL OR source_type = %s::text)
                 ORDER BY received_at DESC, created_at DESC
                 LIMIT %s
                 """,
@@ -1284,7 +1759,7 @@ def get_workflow_state(entity_type: str, entity_id: str) -> Optional[Dict[str, A
                 """
                 SELECT
                   id, entity_type, entity_id, current_state, current_stage,
-                  confidence, metadata, created_at, updated_at
+                  confidence, breach_risk, metadata, created_at, updated_at
                 FROM workflow_states
                 WHERE entity_type = %s AND entity_id = %s
                 """,
@@ -1309,11 +1784,11 @@ def list_workflow_states(
                 """
                 SELECT
                   id, entity_type, entity_id, current_state, current_stage,
-                  confidence, metadata, created_at, updated_at
+                  confidence, breach_risk, metadata, created_at, updated_at
                 FROM workflow_states
-                WHERE (%s IS NULL OR entity_type = %s)
-                  AND (%s IS NULL OR current_state = %s)
-                  AND (%s IS NULL OR current_stage = %s)
+                WHERE (%s::text IS NULL OR entity_type = %s::text)
+                  AND (%s::text IS NULL OR current_state = %s::text)
+                  AND (%s::text IS NULL OR current_stage = %s::text)
                 ORDER BY updated_at DESC, created_at DESC
                 LIMIT %s
                 """,
@@ -1378,11 +1853,11 @@ def list_agent_tasks(
                   heartbeat_at, started_at, completed_at, last_error,
                   payload, result, created_at, updated_at
                 FROM agent_tasks
-                WHERE (%s IS NULL OR status = %s)
-                  AND (%s IS NULL OR task_type = %s)
-                  AND (%s IS NULL OR entity_type = %s)
-                  AND (%s IS NULL OR entity_id = %s)
-                  AND (%s IS NULL OR source_document_id = %s)
+                WHERE (%s::text IS NULL OR status = %s::text)
+                  AND (%s::text IS NULL OR task_type = %s::text)
+                  AND (%s::text IS NULL OR entity_type = %s::text)
+                  AND (%s::uuid IS NULL OR entity_id = %s::uuid)
+                  AND (%s::uuid IS NULL OR source_document_id = %s::uuid)
                   AND (%s = false OR attempt_count > 1)
                 ORDER BY updated_at DESC, created_at DESC
                 LIMIT %s
@@ -1403,6 +1878,28 @@ def list_agent_tasks(
                 ),
             )
             return [_task_row(row) for row in cur.fetchall()]
+
+
+def get_agent_task(task_id: str) -> Optional[Dict[str, Any]]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            _assert_agent_tables(cur)
+            cur.execute(
+                """
+                SELECT
+                  id, task_type, entity_type, entity_id, source_document_id,
+                  priority, status, attempt_count, max_attempts, dedupe_key,
+                  available_at, lease_expires_at, locked_by, locked_at,
+                  heartbeat_at, started_at, completed_at, last_error,
+                  payload, result, created_at, updated_at
+                FROM agent_tasks
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (task_id,),
+            )
+            row = cur.fetchone()
+            return _task_row(row) if row else None
 
 
 def list_agent_decisions(
@@ -1426,10 +1923,10 @@ def list_agent_decisions(
                 FROM agent_decisions AS d
                 LEFT JOIN agent_tasks AS t
                   ON t.id = d.task_id
-                WHERE (%s IS NULL OR d.entity_type = %s)
-                  AND (%s IS NULL OR d.entity_id = %s)
-                  AND (%s IS NULL OR d.task_id = %s)
-                  AND (%s IS NULL OR t.source_document_id = %s)
+                WHERE (%s::text IS NULL OR d.entity_type = %s::text)
+                  AND (%s::uuid IS NULL OR d.entity_id = %s::uuid)
+                  AND (%s::uuid IS NULL OR d.task_id = %s::uuid)
+                  AND (%s::uuid IS NULL OR t.source_document_id = %s::uuid)
                 ORDER BY d.created_at DESC
                 LIMIT %s
                 """,
@@ -1448,9 +1945,220 @@ def list_agent_decisions(
             return [_decision_row(row) for row in cur.fetchall()]
 
 
+def _parse_iso_datetime(value: Any) -> Optional[datetime.datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime.datetime):
+        return value
+    text = str(value)
+    if not text:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _decision_tone(decision: Optional[str], metadata: Dict[str, Any]) -> str:
+    lowered = str(decision or "").strip().lower()
+    if any(token in lowered for token in ("failed", "rejected", "blocked", "dead_letter", "escalat")):
+        return "failure"
+    if lowered in {"unmatched", "vendor_mismatch", "needs_review"}:
+        return "failure"
+    if any(token in lowered for token in ("warning", "retry", "review", "pending", "breaching")):
+        return "warning"
+    if metadata.get("outcome") == "failed":
+        return "failure"
+    return "success"
+
+
+def _workflow_tone(event_type: Optional[str], metadata: Dict[str, Any]) -> str:
+    lowered = str(event_type or "").strip().lower()
+    if lowered == "sla_risk_changed":
+        breach_risk = str(metadata.get("breach_risk") or "").strip().lower()
+        if breach_risk == "breached":
+            return "failure"
+        if breach_risk in {"warning", "breaching"}:
+            return "warning"
+    return "state_transition"
+
+
+def _review_override_payload(review_item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not review_item:
+        return None
+    metadata = review_item.get("metadata") or {}
+    resolution = review_item.get("resolution")
+    status = review_item.get("status")
+    if status not in {"resolved", "dismissed"} and not resolution:
+        return None
+    override_reason = (
+        resolution
+        or metadata.get("override_reason")
+        or metadata.get("resolution_reason")
+        or metadata.get("approved_by")
+        or metadata.get("rejected_by")
+        or "Resolved during human review"
+    )
+    return {
+        "review_item_id": review_item.get("id"),
+        "review_status": status,
+        "override_reason": override_reason,
+        "resolved_at": review_item.get("resolved_at") or review_item.get("updated_at"),
+    }
+
+
+def get_invoice_audit_trail(invoice_id: str, *, limit: int = 500) -> Optional[Dict[str, Any]]:
+    limit = _coerce_limit(limit, default=500, max_value=1000)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            _assert_agent_tables(cur)
+            cur.execute("SELECT 1 FROM invoices WHERE id = %s LIMIT 1", (invoice_id,))
+            if not cur.fetchone():
+                return None
+
+            cur.execute(
+                """
+                SELECT
+                  d.id, d.task_id, d.entity_type, d.entity_id, d.agent_name, d.model_name,
+                  d.prompt_version, d.decision_type, d.decision, d.confidence,
+                  d.reasoning_summary, d.tool_calls, d.metadata, d.created_at
+                FROM agent_decisions AS d
+                WHERE d.entity_type = 'invoice' AND d.entity_id = %s
+                ORDER BY d.created_at ASC
+                LIMIT %s
+                """,
+                (invoice_id, limit),
+            )
+            decisions = [_decision_row(row) for row in cur.fetchall()]
+
+            cur.execute(
+                """
+                SELECT
+                  id, entity_type, entity_id, from_state, to_state, event_type,
+                  reason, actor_type, actor_id, metadata, created_at
+                FROM workflow_state_history
+                WHERE entity_type = 'invoice' AND entity_id = %s
+                ORDER BY created_at ASC
+                LIMIT %s
+                """,
+                (invoice_id, limit),
+            )
+            workflow_history = [_workflow_history_row(row) for row in cur.fetchall()]
+
+            cur.execute(
+                """
+                SELECT
+                  id, entity_type, entity_id, source_document_id, invoice_id,
+                  queue_name, priority, status, review_reason, assigned_to,
+                  due_at, resolution, metadata, created_at, updated_at, resolved_at
+                FROM human_review_queue
+                WHERE (entity_type = 'invoice' AND entity_id = %s)
+                   OR invoice_id = %s
+                ORDER BY created_at ASC
+                LIMIT %s
+                """,
+                (invoice_id, invoice_id, limit),
+            )
+            review_items = [_human_review_row(row) for row in cur.fetchall()]
+
+    review_overrides = {}
+    for review_item in review_items:
+        payload = _review_override_payload(review_item)
+        if payload:
+            review_overrides[review_item["id"]] = payload
+
+    events: List[Dict[str, Any]] = []
+    agent_names = set()
+    human_touchpoint_count = 0
+
+    for decision in decisions:
+        metadata = decision.get("metadata") or {}
+        review_item_id = metadata.get("review_item_id")
+        override_payload = review_overrides.get(review_item_id) if review_item_id else None
+        timestamp = decision.get("created_at")
+        events.append(
+            {
+                "id": decision["id"],
+                "timestamp": timestamp,
+                "type": "decision",
+                "display_tone": _decision_tone(decision.get("decision"), metadata),
+                "agent_name": decision.get("agent_name"),
+                "decision_type": decision.get("decision_type"),
+                "action": decision.get("decision"),
+                "confidence": decision.get("confidence"),
+                "reasoning": decision.get("reasoning_summary") or "",
+                "metadata": metadata,
+                "review_item_id": review_item_id,
+                "overridden": bool(override_payload),
+                "override_reason": (override_payload or {}).get("override_reason"),
+                "override_resolved_at": (override_payload or {}).get("resolved_at"),
+            }
+        )
+        if decision.get("agent_name"):
+            agent_names.add(decision["agent_name"])
+
+    for history_item in workflow_history:
+        metadata = history_item.get("metadata") or {}
+        events.append(
+            {
+                "id": history_item["id"],
+                "timestamp": history_item.get("created_at"),
+                "type": "state_change",
+                "display_tone": _workflow_tone(history_item.get("event_type"), metadata),
+                "event_type": history_item.get("event_type"),
+                "before_state": history_item.get("from_state"),
+                "after_state": history_item.get("to_state"),
+                "reason": history_item.get("reason"),
+                "actor_type": history_item.get("actor_type"),
+                "actor_id": history_item.get("actor_id"),
+                "metadata": metadata,
+            }
+        )
+        if history_item.get("actor_type") == "human":
+            human_touchpoint_count += 1
+
+    for review_item in review_items:
+        if review_item.get("assigned_to"):
+            human_touchpoint_count += 1
+        elif review_item.get("status") in {"resolved", "dismissed"} and (
+            review_item.get("resolution") or (review_item.get("metadata") or {})
+        ):
+            human_touchpoint_count += 1
+
+    events.sort(
+        key=lambda item: (
+            _parse_iso_datetime(item.get("timestamp")) or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc),
+            0 if item.get("type") == "state_change" else 1,
+            str(item.get("id") or ""),
+        )
+    )
+
+    timestamps = [_parse_iso_datetime(item.get("timestamp")) for item in events if item.get("timestamp")]
+    timestamps = [value for value in timestamps if value is not None]
+    first_event_at = timestamps[0].isoformat() if timestamps else None
+    last_event_at = timestamps[-1].isoformat() if timestamps else None
+    total_processing_time_seconds = 0
+    if len(timestamps) >= 2:
+        total_processing_time_seconds = int((timestamps[-1] - timestamps[0]).total_seconds())
+
+    return {
+        "invoice_id": invoice_id,
+        "events": events,
+        "summary": {
+            "agent_count": len(agent_names),
+            "human_touchpoint_count": human_touchpoint_count,
+            "event_count": len(events),
+            "first_event_at": first_event_at,
+            "last_event_at": last_event_at,
+            "total_processing_time_seconds": total_processing_time_seconds,
+        },
+    }
+
+
 def list_human_review_items(
     *,
     status: Optional[str] = None,
+    active_only: bool = False,
     queue_name: Optional[str] = None,
     entity_type: Optional[str] = None,
     entity_id: Optional[str] = None,
@@ -1460,6 +2168,11 @@ def list_human_review_items(
     limit: int = 100,
 ) -> List[Dict[str, Any]]:
     limit = _coerce_limit(limit)
+    normalized_status = str(status or "").strip().lower() or None
+    if normalized_status == "pending":
+        normalized_status = "open"
+    elif normalized_status == "in_review":
+        normalized_status = "assigned"
     with get_conn() as conn:
         with conn.cursor() as cur:
             _assert_agent_tables(cur)
@@ -1470,19 +2183,21 @@ def list_human_review_items(
                   queue_name, priority, status, review_reason, assigned_to,
                   due_at, resolution, metadata, created_at, updated_at, resolved_at
                 FROM human_review_queue
-                WHERE (%s IS NULL OR status = %s)
-                  AND (%s IS NULL OR queue_name = %s)
-                  AND (%s IS NULL OR entity_type = %s)
-                  AND (%s IS NULL OR entity_id = %s)
-                  AND (%s IS NULL OR source_document_id = %s)
-                  AND (%s IS NULL OR invoice_id = %s)
-                  AND (%s IS NULL OR assigned_to = %s)
+                WHERE (%s::text IS NULL OR status = %s::text)
+                  AND (%s::boolean = false OR status IN ('open', 'assigned'))
+                  AND (%s::text IS NULL OR queue_name = %s::text)
+                  AND (%s::text IS NULL OR entity_type = %s::text)
+                  AND (%s::uuid IS NULL OR entity_id = %s::uuid)
+                  AND (%s::uuid IS NULL OR source_document_id = %s::uuid)
+                  AND (%s::uuid IS NULL OR invoice_id = %s::uuid)
+                  AND (%s::text IS NULL OR assigned_to = %s::text)
                 ORDER BY priority ASC, created_at DESC
                 LIMIT %s
                 """,
                 (
-                    status,
-                    status,
+                    normalized_status,
+                    normalized_status,
+                    active_only,
                     queue_name,
                     queue_name,
                     entity_type,
@@ -1498,7 +2213,34 @@ def list_human_review_items(
                     limit,
                 ),
             )
-            return [_human_review_row(row) for row in cur.fetchall()]
+            return _enrich_human_review_items([_human_review_row(row) for row in cur.fetchall()])
+
+
+def get_human_review_queue_counts(*, urgent_priority_threshold: int = 80) -> Dict[str, int]:
+    urgent_priority_threshold = max(0, int(urgent_priority_threshold))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            _assert_agent_tables(cur)
+            cur.execute(
+                """
+                SELECT
+                  COUNT(*) FILTER (WHERE status = 'open') AS open_count,
+                  COUNT(*) FILTER (WHERE status = 'assigned') AS in_review_count,
+                  COUNT(*) FILTER (WHERE status IN ('open', 'assigned') AND priority <= %s) AS urgent_count
+                FROM human_review_queue
+                """,
+                (urgent_priority_threshold,),
+            )
+            row = cur.fetchone() or (0, 0, 0)
+            open_count = int(row[0] or 0)
+            in_review_count = int(row[1] or 0)
+            urgent_count = int(row[2] or 0)
+            return {
+                "pending_count": open_count + in_review_count,
+                "open_count": open_count,
+                "in_review_count": in_review_count,
+                "urgent_count": urgent_count,
+            }
 
 
 def list_sla_configs(
@@ -1512,11 +2254,11 @@ def list_sla_configs(
             cur.execute(
                 """
                 SELECT
-                  id, entity_type, state_name, target_minutes, escalation_queue,
-                  is_active, metadata, created_at, updated_at
+                  id, entity_type, state_name, target_minutes, warning_minutes, breach_minutes,
+                  escalation_queue, is_active, metadata, created_at, updated_at
                 FROM sla_configs
-                WHERE (%s IS NULL OR entity_type = %s)
-                  AND (%s = false OR is_active = true)
+                WHERE (%s::text IS NULL OR entity_type = %s::text)
+                  AND (%s::boolean = false OR is_active = true)
                 ORDER BY entity_type ASC, state_name ASC
                 """,
                 (
@@ -1546,22 +2288,26 @@ def list_sla_breaches(
                   ws.current_state,
                   ws.current_stage,
                   ws.confidence,
+                  ws.breach_risk,
                   ws.metadata,
                   ws.updated_at,
                   sc.target_minutes,
+                  sc.warning_minutes,
+                  sc.breach_minutes,
                   sc.escalation_queue,
                   sc.metadata,
                   ROUND((EXTRACT(EPOCH FROM (now() - ws.updated_at)) / 60.0)::numeric, 2) AS age_minutes,
-                  ROUND(((EXTRACT(EPOCH FROM (now() - ws.updated_at)) / 60.0) - sc.target_minutes)::numeric, 2) AS breach_minutes
+                  ROUND(((EXTRACT(EPOCH FROM (now() - ws.updated_at)) / 60.0) - sc.warning_minutes)::numeric, 2) AS warning_delta_minutes,
+                  ROUND(((EXTRACT(EPOCH FROM (now() - ws.updated_at)) / 60.0) - sc.breach_minutes)::numeric, 2) AS breach_delta_minutes
                 FROM workflow_states AS ws
                 INNER JOIN sla_configs AS sc
                   ON sc.entity_type = ws.entity_type
                  AND sc.state_name = ws.current_state
                  AND sc.is_active = true
-                WHERE (%s IS NULL OR ws.entity_type = %s)
-                  AND (%s IS NULL OR ws.current_state = %s)
-                  AND (EXTRACT(EPOCH FROM (now() - ws.updated_at)) / 60.0) > sc.target_minutes
-                ORDER BY breach_minutes DESC, ws.updated_at ASC
+                WHERE (%s::text IS NULL OR ws.entity_type = %s::text)
+                  AND (%s::text IS NULL OR ws.current_state = %s::text)
+                  AND ws.breach_risk IN ('warning', 'breaching', 'breached')
+                ORDER BY breach_delta_minutes DESC, ws.updated_at ASC
                 LIMIT %s
                 """,
                 (
@@ -1614,7 +2360,7 @@ def get_source_document_detail(source_document_id: str) -> Optional[Dict[str, An
                 """
                 SELECT
                   id, entity_type, entity_id, current_state, current_stage,
-                  confidence, metadata, created_at, updated_at
+                  confidence, breach_risk, metadata, created_at, updated_at
                 FROM workflow_states
                 WHERE entity_type = 'source_document' AND entity_id = %s
                 """,
@@ -1779,17 +2525,15 @@ def get_agent_operations_overview() -> Dict[str, Any]:
 
             cur.execute(
                 """
-                SELECT COUNT(*)
-                FROM workflow_states AS ws
-                INNER JOIN sla_configs AS sc
-                  ON sc.entity_type = ws.entity_type
-                 AND sc.state_name = ws.current_state
-                 AND sc.is_active = true
-                WHERE (EXTRACT(EPOCH FROM (now() - ws.updated_at)) / 60.0) > sc.target_minutes
+                SELECT
+                  breach_risk,
+                  COUNT(*)
+                FROM workflow_states
+                WHERE breach_risk IN ('warning', 'breaching', 'breached')
+                GROUP BY breach_risk
                 """
             )
-            sla_breach_count_row = cur.fetchone()
-            sla_breach_count = int(sla_breach_count_row[0]) if sla_breach_count_row else 0
+            sla_risk_counts = {row[0]: int(row[1]) for row in cur.fetchall()}
 
             return {
                 "source_documents": {
@@ -1806,6 +2550,223 @@ def get_agent_operations_overview() -> Dict[str, Any]:
                 },
                 "workflow_states": workflow_counts,
                 "sla": {
-                    "active_breach_count": sla_breach_count,
+                    "active_breach_count": (
+                        sla_risk_counts.get("warning", 0)
+                        + sla_risk_counts.get("breaching", 0)
+                        + sla_risk_counts.get("breached", 0)
+                    ),
+                    "by_risk": sla_risk_counts,
+                },
+            }
+
+
+def get_agent_operations_metrics(*, window_days: int = 30) -> Dict[str, Any]:
+    window_days = max(1, min(int(window_days or 30), 365))
+    window_start = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=window_days)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            _assert_agent_tables(cur)
+            cur.execute("SELECT to_regclass('public.payment_authorization_requests')")
+            payment_auth_table = cur.fetchone()
+            has_payment_authorization_requests = bool(payment_auth_table and payment_auth_table[0])
+
+            cur.execute(
+                """
+                SELECT id::text, created_at
+                FROM invoices
+                WHERE created_at >= %s
+                ORDER BY created_at DESC, id DESC
+                """,
+                (window_start,),
+            )
+            invoice_rows = cur.fetchall()
+            invoice_ids = [row[0] for row in invoice_rows if row and row[0]]
+
+            review_touchpoints: Dict[str, int] = {}
+            payment_touchpoints: Dict[str, int] = {}
+            vendor_touchpoints: Dict[str, int] = {}
+            processing_durations: List[float] = []
+
+            if invoice_ids:
+                cur.execute(
+                    """
+                    SELECT invoice_id::text, COUNT(*)
+                    FROM human_review_queue
+                    WHERE invoice_id::text = ANY(%s)
+                    GROUP BY invoice_id::text
+                    """,
+                    (invoice_ids,),
+                )
+                review_touchpoints = {row[0]: int(row[1]) for row in cur.fetchall() if row and row[0]}
+
+                cur.execute(
+                    """
+                    SELECT invoice_id::text, COUNT(*)
+                    FROM vendor_communications
+                    WHERE invoice_id::text = ANY(%s)
+                      AND (
+                        approved_by IS NOT NULL
+                        OR status IN ('approved', 'sent', 'outbound')
+                      )
+                    GROUP BY invoice_id::text
+                    """,
+                    (invoice_ids,),
+                )
+                vendor_touchpoints = {row[0]: int(row[1]) for row in cur.fetchall() if row and row[0]}
+
+                if has_payment_authorization_requests:
+                    cur.execute(
+                        """
+                        SELECT elem.value AS invoice_id, COUNT(*)
+                        FROM payment_authorization_requests AS par
+                        CROSS JOIN LATERAL jsonb_array_elements_text(par.invoice_ids) AS elem(value)
+                        WHERE elem.value = ANY(%s)
+                          AND (par.approved_by IS NOT NULL OR par.rejected_by IS NOT NULL)
+                        GROUP BY elem.value
+                        """,
+                        (invoice_ids,),
+                    )
+                    payment_touchpoints = {
+                        row[0]: int(row[1]) for row in cur.fetchall() if row and row[0]
+                    }
+
+                cur.execute(
+                    """
+                    SELECT entity_id::text, MIN(created_at), MAX(created_at)
+                    FROM (
+                      SELECT entity_id, created_at
+                      FROM workflow_state_history
+                      WHERE entity_type = 'invoice' AND entity_id::text = ANY(%s)
+                      UNION ALL
+                      SELECT entity_id, created_at
+                      FROM agent_decisions
+                      WHERE entity_type = 'invoice' AND entity_id::text = ANY(%s)
+                      UNION ALL
+                      SELECT invoice_id AS entity_id, created_at
+                      FROM human_review_queue
+                      WHERE invoice_id::text = ANY(%s)
+                    ) AS invoice_events
+                    GROUP BY entity_id::text
+                    """,
+                    (invoice_ids, invoice_ids, invoice_ids),
+                )
+                for invoice_id, first_event_at, last_event_at in cur.fetchall():
+                    if not invoice_id or not first_event_at or not last_event_at:
+                        continue
+                    processing_durations.append(
+                        max(
+                            0.0,
+                            (last_event_at - first_event_at).total_seconds(),
+                        )
+                    )
+
+            fully_automated = 0
+            fast_approval = 0
+            deeper_human_involvement = 0
+            for invoice_id in invoice_ids:
+                review_count = review_touchpoints.get(invoice_id, 0)
+                payment_count = payment_touchpoints.get(invoice_id, 0)
+                vendor_count = vendor_touchpoints.get(invoice_id, 0)
+                total_touchpoints = review_count + payment_count + vendor_count
+
+                if total_touchpoints == 0:
+                    fully_automated += 1
+                elif total_touchpoints == 1 and review_count == 0 and vendor_count == 0 and payment_count == 1:
+                    fast_approval += 1
+                else:
+                    deeper_human_involvement += 1
+
+            cur.execute(
+                """
+                SELECT
+                  agent_name,
+                  COUNT(*) AS decision_count,
+                  AVG(confidence) AS average_confidence
+                FROM agent_decisions
+                WHERE created_at >= %s
+                GROUP BY agent_name
+                ORDER BY decision_count DESC, agent_name ASC
+                """,
+                (window_start,),
+            )
+            agent_activity = [
+                {
+                    "agent_name": row[0],
+                    "decision_count": int(row[1]),
+                    "average_confidence": float(row[2]) if row[2] is not None else None,
+                }
+                for row in cur.fetchall()
+            ]
+
+            cur.execute(
+                """
+                SELECT COALESCE(breach_risk, 'ok') AS breach_risk, COUNT(*)
+                FROM workflow_states
+                WHERE entity_type = 'invoice'
+                  AND COALESCE(current_state, '') NOT IN ('paid', 'rejected', 'dismissed', 'canceled', 'dead_letter')
+                GROUP BY COALESCE(breach_risk, 'ok')
+                """
+            )
+            sla_health = {"ok": 0, "warning": 0, "breaching": 0, "breached": 0}
+            for breach_risk, count in cur.fetchall():
+                if breach_risk in sla_health:
+                    sla_health[breach_risk] = int(count)
+
+            cur.execute(
+                """
+                SELECT COUNT(DISTINCT entity_id::text)
+                FROM agent_decisions
+                WHERE entity_type = 'invoice'
+                  AND agent_name = 'exception_resolution_agent'
+                  AND decision = 'resolved'
+                  AND created_at >= %s
+                """,
+                (window_start,),
+            )
+            auto_resolved_row = cur.fetchone()
+            auto_resolved = int(auto_resolved_row[0]) if auto_resolved_row else 0
+
+            cur.execute(
+                """
+                SELECT COUNT(DISTINCT invoice_id::text)
+                FROM human_review_queue
+                WHERE invoice_id IS NOT NULL
+                  AND queue_name = 'po_matching'
+                  AND created_at >= %s
+                """,
+                (window_start,),
+            )
+            escalated_row = cur.fetchone()
+            escalated = int(escalated_row[0]) if escalated_row else 0
+
+            total_invoices_processed = len(invoice_ids)
+            automation_rate_percent = (
+                round((fully_automated / total_invoices_processed) * 100.0, 2)
+                if total_invoices_processed
+                else 0.0
+            )
+            average_processing_time_seconds = (
+                round(sum(processing_durations) / len(processing_durations), 2)
+                if processing_durations
+                else 0.0
+            )
+
+            return {
+                "window_days": window_days,
+                "generated_at": _iso(datetime.datetime.now(datetime.timezone.utc)),
+                "totals": {
+                    "total_invoices_processed": total_invoices_processed,
+                    "fully_automated": fully_automated,
+                    "fast_approval": fast_approval,
+                    "deeper_human_involvement": deeper_human_involvement,
+                },
+                "automation_rate_percent": automation_rate_percent,
+                "average_processing_time_seconds": average_processing_time_seconds,
+                "agent_activity": agent_activity,
+                "sla_health": sla_health,
+                "exceptions": {
+                    "auto_resolved": auto_resolved,
+                    "escalated": escalated,
                 },
             }

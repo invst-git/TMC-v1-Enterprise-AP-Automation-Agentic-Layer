@@ -1,12 +1,38 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { LayoutDashboard, Users, AlertTriangle, CreditCard } from 'lucide-react';
+import { LayoutDashboard, Bot, ListChecks, Users, AlertTriangle, CreditCard } from 'lucide-react';
+import { useLiveRefresh } from '../lib/useLiveRefresh';
+import { fetchAgentReviewQueueCounts } from '../services/api';
 
 const Sidebar = ({ activeItem }) => {
   const navigate = useNavigate();
+  const [reviewQueueCounts, setReviewQueueCounts] = useState({
+    pending_count: 0,
+    urgent_count: 0,
+  });
+
+  const loadCounts = async () => {
+    try {
+      const counts = await fetchAgentReviewQueueCounts();
+      setReviewQueueCounts(counts || { pending_count: 0, urgent_count: 0 });
+    } catch (_) {
+      return;
+    }
+  };
+
+  useLiveRefresh(loadCounts, []);
 
   const navItems = [
     { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, path: '/' },
+    { id: 'agent-operations', label: 'Agent Ops', icon: Bot, path: '/agent-operations' },
+    {
+      id: 'review-queue',
+      label: 'Review Queue',
+      icon: ListChecks,
+      path: '/review-queue',
+      badge: reviewQueueCounts.pending_count || 0,
+      urgent: (reviewQueueCounts.urgent_count || 0) > 0,
+    },
     { id: 'vendors', label: 'Vendors', icon: Users, path: '/vendors' },
     { id: 'exceptions', label: 'Exceptions', icon: AlertTriangle, path: '/exceptions' },
     { id: 'payments', label: 'Payments', icon: CreditCard, path: '/payments' }
@@ -51,6 +77,17 @@ const Sidebar = ({ activeItem }) => {
                 )}
                 <Icon className="w-4 h-4" strokeWidth={2} />
                 <span className="text-[14px] font-medium">{item.label}</span>
+                {item.badge > 0 && (
+                  <span
+                    className={`ml-auto min-w-[22px] h-[22px] px-1.5 rounded-full text-[11px] font-semibold flex items-center justify-center ${
+                      item.urgent
+                        ? 'bg-red-50 text-red-700 border border-red-200'
+                        : 'bg-gray-100 text-black border border-gray-200'
+                    }`}
+                  >
+                    {item.badge > 99 ? '99+' : item.badge}
+                  </span>
+                )}
               </button>
             );
           })}

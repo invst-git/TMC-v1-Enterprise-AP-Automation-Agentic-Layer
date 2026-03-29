@@ -9,6 +9,7 @@ from realtime_events import publish_live_update
 from source_document_tracking import persist_source_document_segmentation_best_effort
 from source_document_tracking import update_source_document_segment_best_effort
 from user_facing_errors import DuplicateInvoiceBlockedError, get_user_facing_message
+from workflow_task_queue import enqueue_workflow_task
 
 
 def _segment_label(
@@ -26,40 +27,79 @@ def _segment_label(
     )
 
 
-def process_saved_invoice_file(
-    full_path: str,
-    *,
-    from_email: Optional[str],
-    message_id: str,
-    vendor_id_override: Optional[str] = None,
-    original_filename: Optional[str] = None,
-    source_document_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    logs: List[str] = []
-    invoice_ids: List[str] = []
-    validation_results = []
+def _mark_invoice_received_best_effort(invoice_id: str, source_document_id: Optional[str]) -> None:
+    try:
+        from agent_db import set_workflow_state
 
-    segmentation = segment_pdf_document(full_path)
-    logs.extend(build_segmentation_log_lines(original_filename or os.path.basename(full_path), segmentation))
-    persisted_segmentation, segmentation_warning = persist_source_document_segmentation_best_effort(
-        source_document_id,
-        segmentation,
-    )
-    if persisted_segmentation:
-        logs.append(
-            f"Persisted {len(persisted_segmentation['segments'])} source document segment record(s) "
-            f"for source document {source_document_id}"
-        )
-        publish_live_update(
-            "source_document.segmented",
-            {
-                "sourceDocumentId": source_document_id,
-                "segmentCount": len(persisted_segmentation["segments"]),
+        set_workflow_state(
+            "invoice",
+            invoice_id,
+            "received",
+            current_stage="intake",
+            confidence=1.0,
+            event_type="invoice_persisted",
+            reason="Invoice was persisted and entered the invoice lifecycle.",
+            metadata={
+                "invoice_id": invoice_id,
+                "source_document_id": source_document_id,
             },
         )
-    elif segmentation_warning:
-        logs.append(f"Source document segmentation persistence skipped: {segmentation_warning}")
+    except Exception:
+        return
 
+
+def _mark_source_document_extraction_queued_best_effort(source_document_id: Optional[str], queued_count: int) -> None:
+    if not source_document_id:
+        return
+    try:
+        from agent_db import set_workflow_state, update_source_document
+
+        update_source_document(
+            source_document_id,
+            extraction_status="queued",
+            metadata={
+                "extraction": {
+                    "queued_segment_count": queued_count,
+                }
+            },
+        )
+        set_workflow_state(
+            "source_document",
+            source_document_id,
+            "queued_for_extraction",
+            current_stage="extraction",
+            event_type="extraction_queued",
+            reason=f"Queued {queued_count} extraction task(s) for worker processing.",
+            metadata={
+                "source_document_id": source_document_id,
+                "queued_segment_count": queued_count,
+            },
+        )
+    except Exception:
+        return
+
+
+def _agent_worker_enabled() -> bool:
+    value = os.getenv("ENABLE_AGENT_WORKER")
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _process_saved_invoice_file_sync_from_segments(
+    *,
+    full_path: str,
+    from_email: Optional[str],
+    message_id: str,
+    vendor_id_override: Optional[str],
+    original_filename: Optional[str],
+    source_document_id: Optional[str],
+    segmentation,
+    persisted_segmentation,
+    logs: List[str],
+) -> Dict[str, Any]:
+    invoice_ids: List[str] = []
+    validation_results = []
     segments = [segment.to_dict() for segment in segmentation.segments] if segmentation.segments else []
     if not segments:
         segments = [{"page_from": 1, "page_to": 1, "confidence": 1.0, "path": full_path}]
@@ -129,6 +169,7 @@ def process_saved_invoice_file(
             invoice_id = save_result.invoice_id
             invoice_ids.append(invoice_id)
             logs.append(f"Invoice saved to Supabase with id={invoice_id}")
+            _mark_invoice_received_best_effort(invoice_id, source_document_id)
             _, segment_update_warning = update_source_document_segment_best_effort(
                 segment_record_id,
                 status=None if validation.requires_review else "persisted",
@@ -208,4 +249,127 @@ def process_saved_invoice_file(
         "invoice_ids": invoice_ids,
         "segmentation": segmentation.to_dict(),
         "validation": [result.to_dict() for result in validation_results],
+    }
+
+
+def process_saved_invoice_file(
+    full_path: str,
+    *,
+    from_email: Optional[str],
+    message_id: str,
+    vendor_id_override: Optional[str] = None,
+    original_filename: Optional[str] = None,
+    source_document_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    logs: List[str] = []
+
+    segmentation = segment_pdf_document(full_path)
+    logs.extend(build_segmentation_log_lines(original_filename or os.path.basename(full_path), segmentation))
+    persisted_segmentation, segmentation_warning = persist_source_document_segmentation_best_effort(
+        source_document_id,
+        segmentation,
+    )
+    if persisted_segmentation:
+        logs.append(
+            f"Persisted {len(persisted_segmentation['segments'])} source document segment record(s) "
+            f"for source document {source_document_id}"
+        )
+        publish_live_update(
+            "source_document.segmented",
+            {
+                "sourceDocumentId": source_document_id,
+                "segmentCount": len(persisted_segmentation["segments"]),
+            },
+        )
+    elif segmentation_warning:
+        logs.append(f"Source document segmentation persistence skipped: {segmentation_warning}")
+
+    if not source_document_id or not _agent_worker_enabled():
+        return _process_saved_invoice_file_sync_from_segments(
+            full_path=full_path,
+            from_email=from_email,
+            message_id=message_id,
+            vendor_id_override=vendor_id_override,
+            original_filename=original_filename,
+            source_document_id=source_document_id,
+            segmentation=segmentation,
+            persisted_segmentation=persisted_segmentation,
+            logs=logs,
+        )
+
+    segments = [segment.to_dict() for segment in segmentation.segments] if segmentation.segments else []
+    if not segments:
+        segments = [{"page_from": 1, "page_to": 1, "confidence": 1.0, "path": full_path}]
+    persisted_segments = (persisted_segmentation or {}).get("segments") or []
+    queued_tasks: List[Dict[str, Any]] = []
+
+    for index, segment in enumerate(segments, start=1):
+        segment_path = segment.get("path") or full_path
+        label = _segment_label(original_filename, segment, index, len(segments))
+        segment_record = persisted_segments[index - 1] if index - 1 < len(persisted_segments) else None
+        segment_record_id = segment_record.get("id") if segment_record else None
+        task_payload = {
+            "invoice_path": segment_path,
+            "message_id": message_id,
+            "from_email": from_email,
+            "vendor_id_override": vendor_id_override,
+            "original_filename": original_filename,
+            "source_document_id": source_document_id,
+            "source_document_segment_id": segment_record_id,
+            "amount_tolerance": 1.0,
+            "percent_tolerance": 0.02,
+        }
+        dedupe_key = (
+            f"source_document_segment:{segment_record_id}:extract.validate"
+            if segment_record_id
+            else f"source_document:{source_document_id}:extract.validate:{index}"
+        )
+        try:
+            task = enqueue_workflow_task(
+                task_type="extract.validate",
+                entity_type="source_document_segment" if segment_record_id else "source_document",
+                entity_id=segment_record_id or source_document_id,
+                source_document_id=source_document_id,
+                dedupe_key=dedupe_key,
+                payload=task_payload,
+            )
+        except Exception:
+            if queued_tasks:
+                raise
+            return _process_saved_invoice_file_sync_from_segments(
+                full_path=full_path,
+                from_email=from_email,
+                message_id=message_id,
+                vendor_id_override=vendor_id_override,
+                original_filename=original_filename,
+                source_document_id=source_document_id,
+                segmentation=segmentation,
+                persisted_segmentation=persisted_segmentation,
+                logs=logs,
+            )
+
+        queued_tasks.append(
+            {
+                "id": task["id"],
+                "segment_label": label,
+                "source_document_segment_id": segment_record_id,
+                "segment_path": segment_path,
+            }
+        )
+        logs.append(f"Queued extraction for {label}; task {task['id']}")
+
+    _mark_source_document_extraction_queued_best_effort(source_document_id, len(queued_tasks))
+    publish_live_update(
+        "source_document.extraction_queued",
+        {
+            "sourceDocumentId": source_document_id,
+            "queuedTaskCount": len(queued_tasks),
+        },
+    )
+    return {
+        "logs": logs,
+        "invoice_ids": [],
+        "segmentation": segmentation.to_dict(),
+        "validation": [],
+        "queued_tasks": queued_tasks,
     }

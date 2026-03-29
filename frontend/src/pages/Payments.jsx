@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import Sidebar from '../components/Sidebar';
-import { fetchPayableInvoices, fetchVendors, formatCurrency, getStatusLabel, createPaymentIntent, confirmPayment, cancelPayment } from '../services/api';
+import { fetchPayableInvoices, fetchVendors, formatCurrency, getStatusLabel, routePaymentBatch, confirmPayment, cancelPayment } from '../services/api';
 import { loadStripe } from '@stripe/stripe-js';
 import { Elements, CardElement, useElements, useStripe } from '@stripe/react-stripe-js';
 import { useLiveRefresh } from '../lib/useLiveRefresh';
@@ -37,7 +37,7 @@ const PayerForm = ({ onSubmit, disabled }) => {
   );
 };
 
-const PayBox = ({ selection, currency, onPaid, onError, customer }) => {
+const PayBox = ({ selection, currency, onPaid, onError, onApprovalPending, customer }) => {
   const stripe = useStripe();
   const elements = useElements();
   const [submitting, setSubmitting] = useState(false);
@@ -45,17 +45,31 @@ const PayBox = ({ selection, currency, onPaid, onError, customer }) => {
   const total = selection.reduce((acc, s) => acc + (s.amount || 0), 0);
 
   const handlePay = async () => {
-    if (!stripe || !elements) return;
     setSubmitting(true);
     setError('');
     try {
-      const { clientSecret, paymentIntentId, error: serverError } = await createPaymentIntent({
+      const routeResult = await routePaymentBatch({
         invoiceIds: selection.map(s => s.id),
         currency,
         customer,
         saveMethod: false
       });
+      if ((routeResult?.status || '').toLowerCase() === 'pending_approval') {
+        const riskLevel = routeResult?.analysis?.risk_level || 'medium';
+        const requestId =
+          routeResult?.authorization_request_id ||
+          routeResult?.authorizationRequestId ||
+          routeResult?.authorization_request?.id;
+        const message = requestId
+          ? `This ${riskLevel} risk batch is waiting for approval before payment can continue. Authorization request ${requestId} has been created.`
+          : `This ${riskLevel} risk batch is waiting for approval before payment can continue.`;
+        if (onApprovalPending) onApprovalPending(message, routeResult);
+        return;
+      }
+      const paymentResult = routeResult?.payment_result || routeResult?.paymentResult || routeResult;
+      const { clientSecret, paymentIntentId, error: serverError } = paymentResult || {};
       if (!clientSecret) throw new Error(serverError || 'No client secret');
+      if (!stripe || !elements) throw new Error('Payment card details are not ready yet. Please try again.');
       const result = await stripe.confirmCardPayment(clientSecret, {
         payment_method: {
           card: elements.getElement(CardElement),
@@ -94,7 +108,7 @@ const PayBox = ({ selection, currency, onPaid, onError, customer }) => {
         <CardElement options={{ hidePostalCode: true }} />
       </div>
       {error && <div className="text-sm text-red-600">{error}</div>}
-      <button onClick={handlePay} disabled={submitting || !stripe || !elements || total <= 0}
+      <button onClick={handlePay} disabled={submitting || total <= 0}
         className="w-full px-4 py-2 bg-black text-white rounded-lg text-sm font-medium hover:bg-gray-800 disabled:opacity-60">
         {submitting ? 'Processing…' : `Pay ${formatCurrency(total)} (${currency || 'USD'})`}
       </button>
@@ -114,6 +128,7 @@ const Payments = () => {
   const [customer, setCustomer] = useState(null);
   const [paid, setPaid] = useState(false);
   const [payError, setPayError] = useState('');
+  const [paymentNotice, setPaymentNotice] = useState('');
 
   const grouped = useMemo(() => {
     const map = new Map();
@@ -263,12 +278,38 @@ const Payments = () => {
                 <div className="text-xs text-red-600 mb-2">Missing REACT_APP_STRIPE_PUBLISHABLE_KEY in environment.</div>
               )}
               <Elements stripe={stripePromise}>
-                <PayBox selection={selectionArray} currency={selectionCurrency || currency || 'USD'} onPaid={() => { setPaid(true); setSelected({}); load(); }} onError={setPayError} customer={customer || {}} />
+                <PayBox
+                  selection={selectionArray}
+                  currency={selectionCurrency || currency || 'USD'}
+                  onPaid={() => {
+                    setPaid(true);
+                    setPayError('');
+                    setPaymentNotice('');
+                    setSelected({});
+                    load();
+                  }}
+                  onError={(message) => {
+                    setPaid(false);
+                    setPaymentNotice('');
+                    setPayError(message);
+                  }}
+                  onApprovalPending={(message) => {
+                    setPaid(false);
+                    setPayError('');
+                    setPaymentNotice(message);
+                    setSelected({});
+                    load();
+                  }}
+                  customer={customer || {}}
+                />
               </Elements>
             </div>
 
             {paid && (
               <div className="p-3 bg-green-50 border border-green-200 rounded text-sm text-green-700">Payment succeeded. Invoices have been marked as paid.</div>
+            )}
+            {paymentNotice && (
+              <div className="p-3 bg-amber-50 border border-amber-200 rounded text-sm text-amber-700">{paymentNotice}</div>
             )}
             {payError && (
               <div className="p-3 bg-red-50 border border-red-200 rounded text-sm text-red-700">{payError}</div>

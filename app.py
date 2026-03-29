@@ -18,7 +18,9 @@ from ingress_tracking import register_ingress_source_document_best_effort
 from agent_worker import start_agent_worker_thread
 from realtime_events import publish_live_update, stream_live_updates
 from agent_db import (
+    get_agent_operations_metrics,
     get_agent_operations_overview,
+    get_invoice_audit_trail,
     get_source_document_detail,
     get_vendor_communication,
     list_agent_decisions,
@@ -31,6 +33,7 @@ from agent_db import (
     list_workflow_history,
     list_workflow_states,
 )
+from sla_monitor_agent import run_sla_monitor_once
 from vendor_communication_agent import (
     approve_vendor_communication,
     create_vendor_communication_draft,
@@ -39,11 +42,21 @@ from vendor_communication_agent import (
 )
 from payment_authorization import (
     approve_payment_authorization,
+    evaluate_and_route_payment_batch,
     execute_payment_authorization,
     get_payment_authorization,
     list_payment_authorizations,
     reject_payment_authorization,
     request_payment_authorization,
+    submit_payment_authorization_request,
+    submit_payment_execution,
+    submit_payment_route,
+)
+from review_queue_service import (
+    assign_review_item,
+    get_review_queue_counts,
+    reject_review_item,
+    resolve_review_item,
 )
 from user_facing_errors import get_error_details, get_user_facing_message
 
@@ -369,9 +382,26 @@ def api_invoice_detail(invoice_id):
         return _error_response(e)
 
 
+@app.route("/api/invoices/<invoice_id>/audit-trail", methods=["GET"])
+def api_invoice_audit_trail(invoice_id):
+    return _agent_api_response(
+        lambda: get_invoice_audit_trail(invoice_id, limit=_parse_limit_arg(500, max_value=1000)),
+        not_found_message="Invoice audit trail not found",
+    )
+
+
 @app.route("/api/agent/overview", methods=["GET"])
 def api_agent_overview():
     return _agent_api_response(get_agent_operations_overview)
+
+
+@app.route("/api/agent/operations/metrics", methods=["GET"])
+def api_agent_operations_metrics():
+    return _agent_api_response(
+        lambda: get_agent_operations_metrics(
+            window_days=request.args.get("days", default=30, type=int),
+        )
+    )
 
 
 @app.route("/api/agent/source-documents", methods=["GET"])
@@ -452,6 +482,7 @@ def api_agent_review_queue():
     return _agent_api_response(
         lambda: list_human_review_items(
             status=request.args.get("status"),
+            active_only=_parse_bool_arg("active_only") or _parse_bool_arg("activeOnly"),
             queue_name=request.args.get("queue_name") or request.args.get("queueName"),
             entity_type=request.args.get("entity_type") or request.args.get("entityType"),
             entity_id=request.args.get("entity_id") or request.args.get("entityId"),
@@ -461,6 +492,67 @@ def api_agent_review_queue():
             limit=_parse_limit_arg(100),
         )
     )
+
+
+@app.route("/api/agent/review-queue/counts", methods=["GET"])
+def api_agent_review_queue_counts():
+    return _agent_api_response(get_review_queue_counts)
+
+
+@app.route("/api/agent/review-queue/<review_item_id>/assign", methods=["POST"])
+def api_agent_review_queue_assign(review_item_id):
+    def loader():
+        data = request.get_json(force=True) or {}
+        reviewer = (data.get("reviewer") or data.get("assignedTo") or data.get("assigned_to") or "").strip()
+        if not reviewer:
+            raise ValueError("reviewer is required")
+        return assign_review_item(review_item_id, reviewer=reviewer)
+
+    return _agent_mutation_response(loader)
+
+
+@app.route("/api/agent/review-queue/<review_item_id>/resolve", methods=["POST"])
+def api_agent_review_queue_resolve(review_item_id):
+    def loader():
+        data = request.get_json(force=True) or {}
+        reviewer = (data.get("reviewer") or data.get("resolvedBy") or data.get("resolved_by") or "").strip()
+        action = (data.get("action") or "").strip()
+        resolution_notes = (data.get("resolutionNotes") or data.get("resolution_notes") or "").strip()
+        selected_po_id = data.get("selectedPoId") or data.get("selected_po_id")
+        if not reviewer:
+            raise ValueError("reviewer is required")
+        if not action:
+            raise ValueError("action is required")
+        if not resolution_notes:
+            raise ValueError("resolutionNotes is required")
+        return resolve_review_item(
+            review_item_id,
+            reviewer=reviewer,
+            action=action,
+            resolution_notes=resolution_notes,
+            selected_po_id=selected_po_id,
+        )
+
+    return _agent_mutation_response(loader)
+
+
+@app.route("/api/agent/review-queue/<review_item_id>/reject", methods=["POST"])
+def api_agent_review_queue_reject(review_item_id):
+    def loader():
+        data = request.get_json(force=True) or {}
+        reviewer = (data.get("reviewer") or data.get("rejectedBy") or data.get("rejected_by") or "").strip()
+        resolution_notes = (data.get("resolutionNotes") or data.get("resolution_notes") or "").strip()
+        if not reviewer:
+            raise ValueError("reviewer is required")
+        if not resolution_notes:
+            raise ValueError("resolutionNotes is required")
+        return reject_review_item(
+            review_item_id,
+            reviewer=reviewer,
+            resolution_notes=resolution_notes,
+        )
+
+    return _agent_mutation_response(loader)
 
 
 @app.route("/api/agent/sla-configs", methods=["GET"])
@@ -482,6 +574,11 @@ def api_agent_sla_breaches():
             limit=_parse_limit_arg(100),
         )
     )
+
+
+@app.route("/api/agent/sla-monitor/run", methods=["POST"])
+def api_agent_sla_monitor_run():
+    return _agent_mutation_response(lambda: run_sla_monitor_once(triggered_by="manual"))
 
 
 @app.route("/api/agent/vendor-communications", methods=["GET"])
@@ -588,7 +685,7 @@ def api_agent_payment_authorize():
         currency = data.get("currency")
         save_method = bool(data.get("saveMethod") or data.get("save_method"))
         requested_by = data.get("requestedBy") or data.get("requested_by")
-        return request_payment_authorization(
+        return submit_payment_authorization_request(
             invoice_ids,
             customer,
             currency=currency,
@@ -597,6 +694,29 @@ def api_agent_payment_authorize():
         )
 
     return _agent_mutation_response(loader, created=True)
+
+
+@app.route("/api/agent/payments/route", methods=["POST"])
+def api_agent_payment_route():
+    try:
+        data = request.get_json(force=True) or {}
+        invoice_ids = data.get("invoiceIds") or data.get("invoice_ids") or []
+        customer = data.get("customer") or {}
+        currency = data.get("currency")
+        save_method = bool(data.get("saveMethod") or data.get("save_method"))
+        requested_by = data.get("requestedBy") or data.get("requested_by")
+        payload = submit_payment_route(
+            invoice_ids,
+            customer,
+            currency=currency,
+            save_method=save_method,
+            requested_by=requested_by,
+        )
+        status_code = 202 if payload.get("status") == "pending_approval" else 200
+        return jsonify(payload), status_code
+    except Exception as e:
+        default_status = 503 if isinstance(e, RuntimeError) else 400 if isinstance(e, ValueError) else 500
+        return _error_response(e, default_status=default_status)
 
 
 @app.route("/api/agent/payments/authorizations/<request_id>/approve", methods=["POST"])
@@ -625,7 +745,7 @@ def api_agent_payment_authorization_reject(request_id):
 
 @app.route("/api/agent/payments/authorizations/<request_id>/execute", methods=["POST"])
 def api_agent_payment_authorization_execute(request_id):
-    return _agent_mutation_response(lambda: execute_payment_authorization(request_id))
+    return _agent_mutation_response(lambda: submit_payment_execution(request_id))
 
 # Vendor API Routes
 @app.route("/api/vendors",methods=["GET"])
@@ -1138,6 +1258,13 @@ def api_cancel_payment():
 def start_scheduler():
     scheduler=BackgroundScheduler(daemon=True)
     scheduler.add_job(run_job,"interval",seconds=CHECK_INTERVAL_SECONDS)
+    scheduler.add_job(
+        lambda: run_sla_monitor_once(triggered_by="scheduler"),
+        "interval",
+        seconds=max(5, int(os.getenv("SLA_MONITOR_INTERVAL_SECONDS", "60"))),
+        max_instances=1,
+        coalesce=True,
+    )
     scheduler.start()
     start_agent_worker_thread()
 

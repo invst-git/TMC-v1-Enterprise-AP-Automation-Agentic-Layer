@@ -1,11 +1,29 @@
 import { useEffect, useRef, useState } from 'react';
 import { subscribeToLiveUpdates } from '../services/api';
 
+const STALE_AFTER_MS = 4000;
+
+const toTimestampMs = (value) => {
+  if (!value) return 0;
+  const parsed = new Date(value);
+  const timestamp = parsed.getTime();
+  return Number.isNaN(timestamp) ? 0 : timestamp;
+};
+
+const isFresh = (value) => {
+  const timestamp = toTimestampMs(value);
+  if (!timestamp) return false;
+  return Date.now() - timestamp <= STALE_AFTER_MS;
+};
+
 export const useLiveRefresh = (load, deps = []) => {
   const loadRef = useRef(load);
+  const lastEventAtRef = useRef(null);
+  const lastSyncAtRef = useRef(null);
   const [liveState, setLiveState] = useState({
     connected: false,
     lastEventAt: null,
+    lastSyncAt: null,
     revision: 0,
   });
 
@@ -27,6 +45,13 @@ export const useLiveRefresh = (load, deps = []) => {
       inFlight = true;
       try {
         await loadRef.current();
+        const syncedAt = new Date().toISOString();
+        lastSyncAtRef.current = syncedAt;
+        setLiveState((current) => ({
+          ...current,
+          connected: true,
+          lastSyncAt: syncedAt,
+        }));
       } finally {
         inFlight = false;
         if (refreshQueued) {
@@ -39,27 +64,36 @@ export const useLiveRefresh = (load, deps = []) => {
     const subscription = subscribeToLiveUpdates({
       onOpen: (payload) => {
         if (closed) return;
-        setLiveState({
+        const eventAt = payload.serverTime || payload.occurredAt || new Date().toISOString();
+        lastEventAtRef.current = eventAt;
+        setLiveState((current) => ({
           connected: true,
-          lastEventAt: payload.serverTime || payload.occurredAt || new Date().toISOString(),
-          revision: payload.revision || 0,
-        });
+          lastEventAt: eventAt,
+          lastSyncAt: current.lastSyncAt,
+          revision: payload.revision || current.revision || 0,
+        }));
         void refresh();
       },
       onChange: (payload) => {
         if (closed) return;
-        setLiveState({
+        const eventAt = payload.serverTime || payload.occurredAt || new Date().toISOString();
+        lastEventAtRef.current = eventAt;
+        setLiveState((current) => ({
           connected: true,
-          lastEventAt: payload.serverTime || payload.occurredAt || new Date().toISOString(),
-          revision: payload.revision || 0,
-        });
+          lastEventAt: eventAt,
+          lastSyncAt: current.lastSyncAt,
+          revision: payload.revision || current.revision || 0,
+        }));
         void refresh();
       },
       onHeartbeat: (payload) => {
         if (closed) return;
+        const eventAt = payload.serverTime || payload.occurredAt || new Date().toISOString();
+        lastEventAtRef.current = eventAt;
         setLiveState((current) => ({
           connected: true,
-          lastEventAt: payload.serverTime || payload.occurredAt || new Date().toISOString(),
+          lastEventAt: eventAt,
+          lastSyncAt: current.lastSyncAt,
           revision: payload.revision || current.revision,
         }));
         void refresh();
@@ -68,10 +102,33 @@ export const useLiveRefresh = (load, deps = []) => {
         if (closed) return;
         setLiveState((current) => ({
           ...current,
-          connected: false,
+          connected:
+            isFresh(lastEventAtRef.current) || isFresh(lastSyncAtRef.current)
+              ? current.connected
+              : false,
         }));
       },
     });
+
+    const stalenessInterval = window.setInterval(() => {
+      if (closed) return;
+      const shouldFallbackRefresh =
+        document.visibilityState !== 'hidden' &&
+        !isFresh(lastEventAtRef.current) &&
+        !isFresh(lastSyncAtRef.current) &&
+        !inFlight;
+      if (shouldFallbackRefresh) {
+        void refresh();
+      }
+      setLiveState((current) => {
+        const healthy = isFresh(lastEventAtRef.current) || isFresh(lastSyncAtRef.current);
+        if (current.connected === healthy) return current;
+        return {
+          ...current,
+          connected: healthy,
+        };
+      });
+    }, 1000);
 
     const handleVisibility = () => {
       if (document.visibilityState === 'visible') {
@@ -85,6 +142,7 @@ export const useLiveRefresh = (load, deps = []) => {
     return () => {
       closed = true;
       subscription.close();
+      window.clearInterval(stalenessInterval);
       document.removeEventListener('visibilitychange', handleVisibility);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

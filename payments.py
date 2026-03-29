@@ -15,6 +15,30 @@ if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
 
+def _set_invoice_workflow_state_best_effort(
+    invoice_id: str,
+    state: str,
+    *,
+    reason: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    try:
+        from agent_db import set_workflow_state
+
+        set_workflow_state(
+            "invoice",
+            invoice_id,
+            state,
+            current_stage="payments",
+            confidence=1.0,
+            event_type="invoice_status_synced",
+            reason=reason,
+            metadata=metadata or {},
+        )
+    except Exception:
+        return None
+
+
 def _assert_payment_tables(cur) -> None:
     """Ensure required payment tables exist; raise with guidance if missing."""
     cur.execute("SELECT to_regclass('public.payments'), to_regclass('public.payment_invoices')")
@@ -266,6 +290,16 @@ def create_payment_intent_for_invoices(
                 """,
                 (invoice_ids,),
             )
+            for invoice_id in invoice_ids:
+                _set_invoice_workflow_state_best_effort(
+                    str(invoice_id),
+                    "payment_pending",
+                    reason="Payment intent was created for this invoice batch.",
+                    metadata={
+                        "payment_intent_id": intent.id,
+                        "payment_id": str(payment_id),
+                    },
+                )
 
             result = {
                 "paymentId": str(payment_id),
@@ -303,6 +337,13 @@ def mark_payment_succeeded(payment_intent_id: str) -> None:
             if ids:
                 cur.execute("UPDATE invoices SET status='paid' WHERE id = ANY(%s)", (ids,))
             cur.execute("UPDATE payments SET status='succeeded' WHERE id=%s", (payment_id,))
+            for invoice_id in ids:
+                _set_invoice_workflow_state_best_effort(
+                    str(invoice_id),
+                    "paid",
+                    reason="Stripe confirmed that the payment succeeded.",
+                    metadata={"payment_intent_id": payment_intent_id},
+                )
             publish_live_update(
                 "payment.succeeded",
                 {
@@ -327,6 +368,12 @@ def mark_payment_failed_or_canceled(payment_intent_id: str) -> None:
             for inv_id, prev in cur.fetchall():
                 cur.execute("UPDATE invoices SET status=%s WHERE id=%s", (prev or 'ready_for_payment', inv_id))
                 reverted_ids.append(str(inv_id))
+                _set_invoice_workflow_state_best_effort(
+                    str(inv_id),
+                    prev or "ready_for_payment",
+                    reason="Payment intent was canceled or failed, so the invoice returned to its prior state.",
+                    metadata={"payment_intent_id": payment_intent_id},
+                )
             cur.execute("UPDATE payments SET status='failed' WHERE id=%s", (payment_id,))
             publish_live_update(
                 "payment.reverted",

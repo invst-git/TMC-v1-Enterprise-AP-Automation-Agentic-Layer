@@ -111,10 +111,50 @@ def get_error_details(exc: Exception, *, default_status: int = 500) -> ErrorDeta
             400,
         )
 
-    if _contains(lowered, "invoiceid is required", "invoiceids required", "paymentintentid is required", "approvedby is required", "rejectedby is required", "sentby is required", "name is required", "vendor is required", "file is required"):
+    if _contains(
+        lowered,
+        "invoiceid is required",
+        "invoiceids required",
+        "paymentintentid is required",
+        "approvedby is required",
+        "rejectedby is required",
+        "sentby is required",
+        "reviewer is required",
+        "resolutionnotes is required",
+        "action is required",
+        "name is required",
+        "vendor is required",
+        "file is required",
+    ):
         return ErrorDetails(
             message,
             "missing_required_input",
+            400,
+        )
+
+    if _contains(
+        lowered,
+        "only pending review items can be assigned",
+        "only pending review items can be resolved",
+        "only pending review items can be rejected",
+    ):
+        return ErrorDetails(
+            "This review item is no longer pending, so it cannot be changed again.",
+            "review_item_not_pending",
+            409,
+        )
+
+    if _contains(lowered, "no candidate po was available in the review packet"):
+        return ErrorDetails(
+            "This review item does not have an available purchase order candidate to approve.",
+            "review_candidate_missing",
+            409,
+        )
+
+    if _contains(lowered, "only invoice review items can approve a po match"):
+        return ErrorDetails(
+            "Only invoice review items can be approved as a purchase order match.",
+            "review_action_not_allowed",
             400,
         )
 

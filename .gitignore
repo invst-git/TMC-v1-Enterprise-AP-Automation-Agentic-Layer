@@ -37,8 +37,9 @@ tests/
 test_*.py
 
 # Markdown docs
-*.md
-
+des.md
+description.md
+README2.md
 # System / IDE
 .DS_Store
 Thumbs.db

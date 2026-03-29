@@ -145,6 +145,13 @@ export const fetchInvoiceById = async (invoiceId) => {
   return await handleResponse(response);
 };
 
+export const fetchInvoiceAuditTrail = async (invoiceId, { limit = 500 } = {}) => {
+  const params = new URLSearchParams();
+  if (limit) params.set('limit', String(limit));
+  const response = await fetch(`${API_BASE_URL}/invoices/${invoiceId}/audit-trail?${params.toString()}`);
+  return await handleResponse(response);
+};
+
 // Fetch all vendors
 export const fetchVendors = async () => {
   const response = await fetch(`${API_BASE_URL}/vendors`);
@@ -254,6 +261,13 @@ export const fetchAgentOverview = async () => {
   return await handleResponse(response);
 };
 
+export const fetchAgentOperationsMetrics = async ({ days = 30 } = {}) => {
+  const params = new URLSearchParams();
+  if (days) params.set('days', String(days));
+  const response = await fetch(`${API_BASE_URL}/agent/operations/metrics?${params.toString()}`);
+  return await handleResponse(response);
+};
+
 export const fetchAgentSourceDocuments = async ({
   ingestionStatus,
   segmentationStatus,
@@ -340,6 +354,7 @@ export const fetchAgentDecisions = async ({
 
 export const fetchAgentReviewQueue = async ({
   status,
+  activeOnly = false,
   queueName,
   entityType,
   entityId,
@@ -350,6 +365,7 @@ export const fetchAgentReviewQueue = async ({
 } = {}) => {
   const params = new URLSearchParams();
   if (status) params.set('status', status);
+  if (activeOnly) params.set('active_only', 'true');
   if (queueName) params.set('queue_name', queueName);
   if (entityType) params.set('entity_type', entityType);
   if (entityId) params.set('entity_id', entityId);
@@ -358,6 +374,48 @@ export const fetchAgentReviewQueue = async ({
   if (assignedTo) params.set('assigned_to', assignedTo);
   if (limit) params.set('limit', String(limit));
   const response = await fetch(`${API_BASE_URL}/agent/review-queue?${params.toString()}`);
+  return await handleResponse(response);
+};
+
+export const fetchAgentReviewQueueCounts = async () => {
+  const response = await fetch(`${API_BASE_URL}/agent/review-queue/counts`);
+  return await handleResponse(response);
+};
+
+export const assignAgentReviewItem = async ({ reviewItemId, reviewer }) => {
+  const response = await fetch(`${API_BASE_URL}/agent/review-queue/${reviewItemId}/assign`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reviewer }),
+  });
+  return await handleResponse(response);
+};
+
+export const resolveAgentReviewItem = async ({
+  reviewItemId,
+  reviewer,
+  action,
+  resolutionNotes,
+  selectedPoId,
+}) => {
+  const response = await fetch(`${API_BASE_URL}/agent/review-queue/${reviewItemId}/resolve`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reviewer, action, resolutionNotes, selectedPoId }),
+  });
+  return await handleResponse(response);
+};
+
+export const rejectAgentReviewItem = async ({
+  reviewItemId,
+  reviewer,
+  resolutionNotes,
+}) => {
+  const response = await fetch(`${API_BASE_URL}/agent/review-queue/${reviewItemId}/reject`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reviewer, resolutionNotes }),
+  });
   return await handleResponse(response);
 };
 
@@ -472,6 +530,21 @@ export const requestPaymentAuthorization = async ({
   requestedBy,
 }) => {
   const response = await fetch(`${API_BASE_URL}/agent/payments/authorize`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ invoiceIds, customer, currency, saveMethod, requestedBy }),
+  });
+  return await handleResponse(response);
+};
+
+export const routePaymentBatch = async ({
+  invoiceIds,
+  customer,
+  currency,
+  saveMethod,
+  requestedBy,
+}) => {
+  const response = await fetch(`${API_BASE_URL}/agent/payments/route`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ invoiceIds, customer, currency, saveMethod, requestedBy }),
