@@ -73,7 +73,7 @@ const Vendors = () => {
       setLoading(false);
     }
   };
-  const liveState = useLiveRefresh(refreshVendors, [selectedVendor?.id || '']);
+  useLiveRefresh(refreshVendors, [selectedVendor?.id || '']);
 
   // Listen for 'open-invoice' events from VendorDetailPanel (to open modal)
   useEffect(() => {
@@ -147,9 +147,6 @@ const Vendors = () => {
             <h1 className="text-2xl sm:text-3xl font-semibold text-black">
               Vendors
             </h1>
-            <span className={`rounded-full px-2 py-1 text-[11px] font-medium ${liveState.connected ? 'bg-green-50 text-green-700 border border-green-200' : 'bg-amber-50 text-amber-700 border border-amber-200'}`}>
-              {liveState.connected ? 'Live' : 'Reconnecting'}
-            </span>
           </div>
 
           {/* Search and Add Button */}

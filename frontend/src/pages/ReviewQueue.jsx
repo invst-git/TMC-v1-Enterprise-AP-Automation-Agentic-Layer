@@ -192,7 +192,7 @@ const ReviewQueue = () => {
     }
   };
 
-  const liveState = useLiveRefresh(load, [statusFilter]);
+  useLiveRefresh(load, [statusFilter]);
 
   const filteredItems = useMemo(
     () => items.filter((item) => matchesPriorityFilter(item, priorityFilter)),
@@ -259,9 +259,6 @@ const ReviewQueue = () => {
         <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between mb-6">
           <div className="flex items-center gap-3">
             <h1 className="text-2xl sm:text-3xl font-semibold text-black">Review Queue</h1>
-            <span className={`rounded-full px-2 py-1 text-[11px] font-medium ${liveState.connected ? 'bg-green-50 text-green-700 border border-green-200' : 'bg-amber-50 text-amber-700 border border-amber-200'}`}>
-              {liveState.connected ? 'Live' : 'Reconnecting'}
-            </span>
           </div>
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
             <div className="flex items-center gap-1 bg-gray-100 rounded-full p-1 border border-gray-200">

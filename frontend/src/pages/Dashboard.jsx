@@ -83,7 +83,7 @@ const Dashboard = () => {
       setLoading(false);
     }
   };
-  const liveState = useLiveRefresh(loadDashboardData, []);
+  useLiveRefresh(loadDashboardData, []);
 
   const handleInvoiceClick = (invoice) => {
     setSelectedInvoice(invoice);
@@ -157,9 +157,6 @@ const Dashboard = () => {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
               <h1 className="text-2xl sm:text-3xl font-semibold text-black">Dashboard</h1>
-              <span className={`hidden sm:inline rounded-full px-2 py-1 text-[11px] font-medium ${liveState.connected ? 'bg-green-50 text-green-700 border border-green-200' : 'bg-amber-50 text-amber-700 border border-amber-200'}`}>
-                {liveState.connected ? 'Live' : 'Reconnecting'}
-              </span>
             </div>
             <span className="ml-3 text-xs sm:text-sm text-gray-500 hidden sm:inline">Last 30 days</span>
           </div>
