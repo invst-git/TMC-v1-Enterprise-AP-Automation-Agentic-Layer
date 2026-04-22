@@ -29,19 +29,19 @@ _TASK_POLICIES: Dict[str, Dict[str, int]] = {
         "max_retry_seconds": 1200,
     },
     "payment.authorize": {
-        "priority": 90,
+        "priority": 10,
         "max_attempts": 1,
         "base_retry_seconds": 0,
         "max_retry_seconds": 0,
     },
     "payment.route": {
-        "priority": 90,
+        "priority": 11,
         "max_attempts": 1,
         "base_retry_seconds": 0,
         "max_retry_seconds": 0,
     },
     "payment.execute": {
-        "priority": 95,
+        "priority": 12,
         "max_attempts": 1,
         "base_retry_seconds": 0,
         "max_retry_seconds": 0,

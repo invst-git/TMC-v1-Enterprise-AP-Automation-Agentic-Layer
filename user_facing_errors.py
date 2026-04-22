@@ -104,6 +104,13 @@ def get_error_details(exc: Exception, *, default_status: int = 500) -> ErrorDeta
             409,
         )
 
+    if _contains(lowered, "payment routing is still being evaluated", "payment processing is still in progress"):
+        return ErrorDetails(
+            "This payment batch is still being evaluated. Please wait a moment and try again.",
+            "payment_still_processing",
+            409 if default_status == 500 else default_status,
+        )
+
     if _contains(lowered, "mixed currency"):
         return ErrorDetails(
             "Invoices with different currencies cannot be paid together.",

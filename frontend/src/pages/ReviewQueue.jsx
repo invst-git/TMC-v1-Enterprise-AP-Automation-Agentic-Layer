@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   CheckCircle2,
   ChevronDown,
@@ -18,6 +18,7 @@ import {
   resolveAgentReviewItem,
 } from '../services/api';
 import { useLiveRefresh } from '../lib/useLiveRefresh';
+import { getPageCache, setPageCache } from '../lib/pageCache';
 
 const STATUS_FILTERS = [
   { value: '', label: 'All' },
@@ -149,18 +150,29 @@ const analysisLabel = (analysis) => {
 };
 
 const ReviewQueue = () => {
+  const cache = getPageCache('review-queue');
   const [activeNav] = useState('review-queue');
-  const [statusFilter, setStatusFilter] = useState('');
-  const [priorityFilter, setPriorityFilter] = useState('all');
-  const [items, setItems] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
-  const [expandedId, setExpandedId] = useState(null);
+  const [statusFilter, setStatusFilter] = useState(cache?.statusFilter || '');
+  const [priorityFilter, setPriorityFilter] = useState(cache?.priorityFilter || 'all');
+  const [items, setItems] = useState(cache?.items || []);
+  const [loading, setLoading] = useState(!cache);
+  const [error, setError] = useState(cache?.error || '');
+  const [expandedId, setExpandedId] = useState(cache?.expandedId || null);
   const [reviewerById, setReviewerById] = useState({});
   const [notesById, setNotesById] = useState({});
   const [selectedPoById, setSelectedPoById] = useState({});
   const [actionState, setActionState] = useState({ itemId: null, action: '' });
   const [actionErrorById, setActionErrorById] = useState({});
+
+  useEffect(() => {
+    setPageCache('review-queue', {
+      statusFilter,
+      priorityFilter,
+      items,
+      error,
+      expandedId,
+    });
+  }, [statusFilter, priorityFilter, items, error, expandedId]);
 
   const load = async () => {
     try {

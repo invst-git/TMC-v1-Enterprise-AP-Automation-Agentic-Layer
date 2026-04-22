@@ -1,9 +1,10 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import Sidebar from '../components/Sidebar';
 import { fetchPayableInvoices, fetchVendors, formatCurrency, getStatusLabel, routePaymentBatch, confirmPayment, cancelPayment } from '../services/api';
 import { loadStripe } from '@stripe/stripe-js';
 import { Elements, CardElement, useElements, useStripe } from '@stripe/react-stripe-js';
 import { useLiveRefresh } from '../lib/useLiveRefresh';
+import { getPageCache, setPageCache } from '../lib/pageCache';
 
 const stripePromise = loadStripe(process.env.REACT_APP_STRIPE_PUBLISHABLE_KEY || '');
 
@@ -37,7 +38,7 @@ const PayerForm = ({ onSubmit, disabled }) => {
   );
 };
 
-const PayBox = ({ selection, currency, onPaid, onError, onApprovalPending, customer }) => {
+const PayBox = ({ selection, currency, onPaid, onError, onApprovalPending, customer, payerReady }) => {
   const stripe = useStripe();
   const elements = useElements();
   const [submitting, setSubmitting] = useState(false);
@@ -61,8 +62,9 @@ const PayBox = ({ selection, currency, onPaid, onError, onApprovalPending, custo
           routeResult?.authorizationRequestId ||
           routeResult?.authorization_request?.id;
         const message = requestId
-          ? `This ${riskLevel} risk batch is waiting for approval before payment can continue. Authorization request ${requestId} has been created.`
+          ? `This ${riskLevel} risk batch is waiting for approval before payment can continue. Authorization request ${requestId} is now in the authorization queue. No charge has been attempted yet.`
           : `This ${riskLevel} risk batch is waiting for approval before payment can continue.`;
+        setError('');
         if (onApprovalPending) onApprovalPending(message, routeResult);
         return;
       }
@@ -95,8 +97,15 @@ const PayBox = ({ selection, currency, onPaid, onError, onApprovalPending, custo
         if (onError) onError('Payment not completed.');
       }
     } catch (e) {
-      setError(e.message);
-      if (onError) onError(e.message);
+      const message = e?.message || 'We could not complete that request. Please try again.';
+      const lowered = String(message).toLowerCase();
+      if (lowered.includes('still being evaluated') || lowered.includes('still in progress')) {
+        setError('');
+        if (onApprovalPending) onApprovalPending(`${message} No charge has been attempted yet.`);
+      } else {
+        setError(message);
+        if (onError) onError(message);
+      }
     } finally {
       setSubmitting(false);
     }
@@ -107,28 +116,44 @@ const PayBox = ({ selection, currency, onPaid, onError, onApprovalPending, custo
       <div className="p-3 border border-gray-200 rounded">
         <CardElement options={{ hidePostalCode: true }} />
       </div>
+      {!payerReady && (
+        <div className="text-xs text-amber-700">
+          Save the payer details before starting payment or approval routing.
+        </div>
+      )}
       {error && <div className="text-sm text-red-600">{error}</div>}
-      <button onClick={handlePay} disabled={submitting || total <= 0}
+      <button onClick={handlePay} disabled={submitting || total <= 0 || !payerReady}
         className="w-full px-4 py-2 bg-black text-white rounded-lg text-sm font-medium hover:bg-gray-800 disabled:opacity-60">
-        {submitting ? 'Processing…' : `Pay ${formatCurrency(total)} (${currency || 'USD'})`}
+        {submitting ? 'Processing...' : `Pay ${formatCurrency(total)} (${currency || 'USD'})`}
       </button>
     </div>
   );
 };
 
 const Payments = () => {
+  const cache = getPageCache('payments');
   const [activeNav] = useState('payments');
-  const [vendors, setVendors] = useState([]);
-  const [selectedVendorId, setSelectedVendorId] = useState('');
-  const [currency, setCurrency] = useState('');
-  const [items, setItems] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
+  const [vendors, setVendors] = useState(cache?.vendors || []);
+  const [selectedVendorId, setSelectedVendorId] = useState(cache?.selectedVendorId || '');
+  const [currency, setCurrency] = useState(cache?.currency || '');
+  const [items, setItems] = useState(cache?.items || []);
+  const [loading, setLoading] = useState(!cache);
+  const [error, setError] = useState(cache?.error || null);
   const [selected, setSelected] = useState({});
   const [customer, setCustomer] = useState(null);
   const [paid, setPaid] = useState(false);
   const [payError, setPayError] = useState('');
   const [paymentNotice, setPaymentNotice] = useState('');
+
+  useEffect(() => {
+    setPageCache('payments', {
+      vendors,
+      selectedVendorId,
+      currency,
+      items,
+      error,
+    });
+  }, [vendors, selectedVendorId, currency, items, error]);
 
   const grouped = useMemo(() => {
     const map = new Map();
@@ -146,6 +171,7 @@ const Payments = () => {
     const set = new Set(selectionArray.map(i => i.currency).filter(Boolean));
     return set.size === 1 ? selectionArray[0]?.currency : '';
   }, [selectionArray]);
+  const payerReady = Boolean(customer?.email && customer?.name);
 
   const load = async () => {
     try {
@@ -212,7 +238,7 @@ const Payments = () => {
 
         {loading && (
           <div className="bg-gray-50 border border-gray-200 rounded-xl p-4 mb-6">
-            <p className="text-sm text-gray-600">Loading payable invoices…</p>
+            <p className="text-sm text-gray-600">Loading payable invoices...</p>
           </div>
         )}
         {error && (
@@ -270,6 +296,11 @@ const Payments = () => {
             <div>
               <h2 className="text-base font-medium text-black mb-2">Payer</h2>
               <PayerForm onSubmit={onSubmitPayer} />
+              {payerReady && customer && (
+                <div className="mt-2 text-xs text-green-700">
+                  Saved payer: {customer.name} ({customer.email})
+                </div>
+              )}
             </div>
 
             <div>
@@ -301,6 +332,7 @@ const Payments = () => {
                     load();
                   }}
                   customer={customer || {}}
+                  payerReady={payerReady}
                 />
               </Elements>
             </div>

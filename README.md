@@ -3,7 +3,7 @@
 
 TMC-v1 is an accounts payable application built around an agentic workflow model for document intake, invoice extraction, validation, matching, exception handling, vendor outreach, and payment authorization.
 
-The current OCR and document extraction layer uses LandingAI.
+The current OCR and document extraction layer uses LandingAI ADE.
 
 Everything else in the application is structured around what happens before extraction, what happens after extraction, how decisions are persisted, how human review is inserted when needed, and how the operational UI stays current without requiring manual refresh.
 

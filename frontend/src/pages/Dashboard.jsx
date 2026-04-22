@@ -1,8 +1,9 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import Sidebar from '../components/Sidebar';
 import LineChart from '../components/LineChart';
 import InvoiceDetailModal from '../components/InvoiceDetailModal';
 import { useLiveRefresh } from '../lib/useLiveRefresh';
+import { getPageCache, setPageCache } from '../lib/pageCache';
 import {
   fetchDashboardStats,
   fetchGraphData,
@@ -17,6 +18,7 @@ import {
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '../components/ui/dialog';
 
 const Dashboard = () => {
+  const cache = getPageCache('dashboard');
   const [activeNav] = useState('dashboard');
   const [selectedInvoice, setSelectedInvoice] = useState(null);
   const [modalOpen, setModalOpen] = useState(false);
@@ -24,16 +26,16 @@ const Dashboard = () => {
 
   // State for data from API
   const [stats, setStats] = useState({
-    invoicesProcessed: 0,
-    amountProcessed: 0,
-    avgDaysSavedPerInvoice: 0,
-    exceptionInvoices: 0,
-    exceptionTimeSavedHours: 0,
+    invoicesProcessed: cache?.stats?.invoicesProcessed || 0,
+    amountProcessed: cache?.stats?.amountProcessed || 0,
+    avgDaysSavedPerInvoice: cache?.stats?.avgDaysSavedPerInvoice || 0,
+    exceptionInvoices: cache?.stats?.exceptionInvoices || 0,
+    exceptionTimeSavedHours: cache?.stats?.exceptionTimeSavedHours || 0,
   });
-  const [graphData, setGraphData] = useState([]);
-  const [recentInvoices, setRecentInvoices] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
+  const [graphData, setGraphData] = useState(cache?.graphData || []);
+  const [recentInvoices, setRecentInvoices] = useState(cache?.recentInvoices || []);
+  const [loading, setLoading] = useState(!cache);
+  const [error, setError] = useState(cache?.error || null);
 
   // Run-now (email ingest) progress + logs
   const [runInProgress, setRunInProgress] = useState(false);
@@ -44,9 +46,19 @@ const Dashboard = () => {
   const [uploadOpen, setUploadOpen] = useState(false);
   const [uploadInProgress, setUploadInProgress] = useState(false);
   const [uploadLogs, setUploadLogs] = useState('');
-  const [vendors, setVendors] = useState([]);
+  const [vendors, setVendors] = useState(cache?.vendors || []);
   const [selectedVendorId, setSelectedVendorId] = useState('');
   const [selectedFile, setSelectedFile] = useState(null);
+
+  useEffect(() => {
+    setPageCache('dashboard', {
+      stats,
+      graphData,
+      recentInvoices,
+      vendors,
+      error,
+    });
+  }, [stats, graphData, recentInvoices, vendors, error]);
 
   const loadDashboardData = async () => {
     try {

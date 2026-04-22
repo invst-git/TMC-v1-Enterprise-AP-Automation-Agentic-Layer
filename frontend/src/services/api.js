@@ -16,6 +16,9 @@ const mapApiErrorMessage = (message) => {
   if (lowered.includes('duplicate payment')) {
     return 'A duplicate invoice was detected in this payment request, so the payment was blocked for safety.';
   }
+  if (lowered.includes('still being evaluated') || lowered.includes('still in progress')) {
+    return 'This payment batch is still being evaluated. Please wait a moment and try again.';
+  }
   if (lowered.includes('already paid')) {
     return 'This invoice has already been paid.';
   }

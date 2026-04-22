@@ -1,19 +1,31 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import Sidebar from '../components/Sidebar';
 import { fetchExceptionInvoices, fetchVendors, getStatusLabel, formatCurrency } from '../services/api';
 import InvoiceDetailModal from '../components/InvoiceDetailModal';
 import { useLiveRefresh } from '../lib/useLiveRefresh';
+import { getPageCache, setPageCache } from '../lib/pageCache';
 
 const Exceptions = () => {
+  const cache = getPageCache('exceptions');
   const [activeNav] = useState('exceptions');
-  const [vendors, setVendors] = useState([]);
-  const [selectedVendorId, setSelectedVendorId] = useState('');
-  const [statusFilter, setStatusFilter] = useState(''); // '', 'unmatched', 'vendor_mismatch', 'needs_review'
-  const [items, setItems] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
+  const [vendors, setVendors] = useState(cache?.vendors || []);
+  const [selectedVendorId, setSelectedVendorId] = useState(cache?.selectedVendorId || '');
+  const [statusFilter, setStatusFilter] = useState(cache?.statusFilter || ''); // '', 'unmatched', 'vendor_mismatch', 'needs_review'
+  const [items, setItems] = useState(cache?.items || []);
+  const [loading, setLoading] = useState(!cache);
+  const [error, setError] = useState(cache?.error || null);
   const [selectedInvoice, setSelectedInvoice] = useState(null);
   const [modalOpen, setModalOpen] = useState(false);
+
+  useEffect(() => {
+    setPageCache('exceptions', {
+      vendors,
+      selectedVendorId,
+      statusFilter,
+      items,
+      error,
+    });
+  }, [vendors, selectedVendorId, statusFilter, items, error]);
 
   const grouped = useMemo(() => {
     const map = new Map();

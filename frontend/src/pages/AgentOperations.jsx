@@ -1,8 +1,9 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Activity, Bot, Clock3, ShieldAlert, Zap } from 'lucide-react';
 import Sidebar from '../components/Sidebar';
 import { useLiveRefresh } from '../lib/useLiveRefresh';
 import { fetchAgentOperationsMetrics, formatNumber } from '../services/api';
+import { getPageCache, setPageCache } from '../lib/pageCache';
 
 const WINDOW_OPTIONS = [7, 30, 90];
 
@@ -20,11 +21,12 @@ const percentWidth = (value, total) => {
 };
 
 const AgentOperations = () => {
+  const cache = getPageCache('agent-operations');
   const [activeNav] = useState('agent-operations');
-  const [days, setDays] = useState(30);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
-  const [metrics, setMetrics] = useState({
+  const [days, setDays] = useState(cache?.days || 30);
+  const [loading, setLoading] = useState(!cache);
+  const [error, setError] = useState(cache?.error || '');
+  const [metrics, setMetrics] = useState(cache?.metrics || {
     totals: {
       total_invoices_processed: 0,
       fully_automated: 0,
@@ -45,6 +47,14 @@ const AgentOperations = () => {
       escalated: 0,
     },
   });
+
+  useEffect(() => {
+    setPageCache('agent-operations', {
+      days,
+      error,
+      metrics,
+    });
+  }, [days, error, metrics]);
 
   const load = async () => {
     try {

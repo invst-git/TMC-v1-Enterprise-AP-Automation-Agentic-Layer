@@ -83,6 +83,10 @@ def _normalize_invoice_ids(invoice_ids: List[str]) -> List[str]:
     return normalized
 
 
+def _canonical_invoice_ids(invoice_ids: List[str]) -> List[str]:
+    return sorted(_unique_invoice_ids(invoice_ids))
+
+
 def _unique_invoice_ids(invoice_ids: List[str]) -> List[str]:
     return list(dict.fromkeys(_normalize_invoice_ids(invoice_ids)))
 
@@ -253,6 +257,71 @@ def _build_risk_reasoning(analysis: Dict[str, Any]) -> str:
         )
 
     return " ".join(reasoning_parts)
+
+
+def _analysis_from_request_record(request_record: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = request_record.get("metadata") or {}
+    signals = metadata.get("risk_signals") or {}
+    return {
+        "invoice_count": int(request_record.get("invoice_count") or 0),
+        "currency": request_record.get("currency") or "USD",
+        "total_amount": float(request_record.get("total_amount") or 0.0),
+        "vendor_count": int((signals.get("vendor_payment_history") or {}).get("vendor_count") or 0),
+        "risk_level": request_record.get("risk_level") or "medium",
+        "risk_reasons": list(request_record.get("risk_reasons") or []),
+        "recommendation": request_record.get("recommendation") or "approval_required",
+        "confidence": float((signals.get("confidence") or 0.78) if isinstance(signals, dict) else 0.78),
+        "signals": signals,
+    }
+
+
+def _matches_authorization_batch(
+    request_record: Dict[str, Any],
+    *,
+    invoice_ids: List[str],
+    currency: Optional[str] = None,
+) -> bool:
+    request_invoice_ids = _canonical_invoice_ids(request_record.get("invoice_ids") or [])
+    if request_invoice_ids != _canonical_invoice_ids(invoice_ids):
+        return False
+    if currency:
+        request_currency = str(request_record.get("currency") or "").strip().upper()
+        if request_currency and request_currency != str(currency).strip().upper():
+            return False
+    return True
+
+
+def _find_matching_pending_authorization_request(
+    dependencies: Dict[str, Any],
+    *,
+    invoice_ids: List[str],
+    currency: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    requests = dependencies["list_payment_authorization_requests"](
+        approval_status="pending_approval",
+        risk_level=None,
+        limit=200,
+    )
+    for request_record in requests:
+        if _matches_authorization_batch(
+            request_record,
+            invoice_ids=invoice_ids,
+            currency=currency,
+        ):
+            return request_record
+    return None
+
+
+def _existing_pending_authorization_payload(
+    request_record: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "status": "pending_approval",
+        "authorization_request_id": request_record["id"],
+        "authorization_request": request_record,
+        "analysis": _analysis_from_request_record(request_record),
+        "reused_existing_request": True,
+    }
 
 
 def _analyze_payment_batch(
@@ -538,6 +607,13 @@ def request_payment_authorization(
 ) -> Dict[str, Any]:
     dependencies = _get_dependencies()
     unique_invoice_ids = _unique_invoice_ids(invoice_ids)
+    existing_request = _find_matching_pending_authorization_request(
+        dependencies,
+        invoice_ids=unique_invoice_ids,
+        currency=currency,
+    )
+    if existing_request:
+        return _existing_pending_authorization_payload(existing_request)
     invoices = _load_batch_invoices(unique_invoice_ids)
     analysis = _analyze_payment_batch(invoice_ids, invoices, currency)
     manual_analysis = dict(analysis)
@@ -581,6 +657,13 @@ def evaluate_and_route_payment_batch(
 ) -> Dict[str, Any]:
     dependencies = _get_dependencies()
     unique_invoice_ids = _unique_invoice_ids(invoice_ids)
+    existing_request = _find_matching_pending_authorization_request(
+        dependencies,
+        invoice_ids=unique_invoice_ids,
+        currency=currency,
+    )
+    if existing_request:
+        return _existing_pending_authorization_payload(existing_request)
     invoices = _load_batch_invoices(unique_invoice_ids)
     analysis = _analyze_payment_batch(invoice_ids, invoices, currency)
     request_record = _create_authorization_request(
@@ -823,7 +906,7 @@ def _payment_batch_dedupe_key(
     currency: Optional[str],
     requested_by: Optional[str],
 ) -> str:
-    unique_invoice_ids = _unique_invoice_ids(invoice_ids)
+    unique_invoice_ids = _canonical_invoice_ids(invoice_ids)
     raw_key = "|".join(
         [
             task_type,
@@ -867,14 +950,23 @@ def _submit_payment_task_and_wait(
     )
     completed_task = wait_for_task_completion(
         task["id"],
-        timeout_seconds=_env_float("AGENT_PAYMENT_WAIT_TIMEOUT_SECONDS", 20.0),
+        timeout_seconds=_env_float("AGENT_PAYMENT_WAIT_TIMEOUT_SECONDS", 45.0),
         poll_interval_seconds=0.2,
     )
     if completed_task and completed_task.get("status") == "completed":
         return completed_task.get("result")
+    if task_type in {"payment.authorize", "payment.route"}:
+        dependencies = _get_dependencies()
+        existing_request = _find_matching_pending_authorization_request(
+            dependencies,
+            invoice_ids=payload.get("invoice_ids") or [],
+            currency=payload.get("currency"),
+        )
+        if existing_request:
+            return _existing_pending_authorization_payload(existing_request)
     _raise_for_task_failure(
         completed_task,
-        "Payment processing is still in progress. Please try again in a moment.",
+        "Payment routing is still being evaluated. Please wait a moment and try again.",
     )
 
 

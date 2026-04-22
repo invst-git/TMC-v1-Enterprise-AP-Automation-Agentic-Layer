@@ -11,18 +11,20 @@ import { Input } from '../components/ui/input';
 import { formatNumber, fetchVendors, fetchVendorStats, fetchVendorById, fetchInvoiceById, fetchPurchaseOrderById, createVendor, deleteVendor } from '../services/api';
 import VendorChat from '../components/VendorChat';
 import { useLiveRefresh } from '../lib/useLiveRefresh';
+import { getPageCache, setPageCache } from '../lib/pageCache';
 
 const Vendors = () => {
+  const cache = getPageCache('vendors');
   const [activeNav] = useState('vendors');
-  const [selectedVendor, setSelectedVendor] = useState(null);
-  const [selectedVendorDetails, setSelectedVendorDetails] = useState(null);
-  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedVendor, setSelectedVendor] = useState(cache?.selectedVendor || null);
+  const [selectedVendorDetails, setSelectedVendorDetails] = useState(cache?.selectedVendorDetails || null);
+  const [searchQuery, setSearchQuery] = useState(cache?.searchQuery || '');
 
   // State for data from API
-  const [vendors, setVendors] = useState([]);
-  const [stats, setStats] = useState({ totalVendors: 0, activeVendors: 0, vendorsWithInvoices30d: 0 });
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
+  const [vendors, setVendors] = useState(cache?.vendors || []);
+  const [stats, setStats] = useState(cache?.stats || { totalVendors: 0, activeVendors: 0, vendorsWithInvoices30d: 0 });
+  const [loading, setLoading] = useState(!cache);
+  const [error, setError] = useState(cache?.error || null);
   const [loadingDetails, setLoadingDetails] = useState(false);
 
   const [invoiceModalOpen, setInvoiceModalOpen] = useState(false);
@@ -34,6 +36,17 @@ const Vendors = () => {
   const [addOpen, setAddOpen] = useState(false);
   const [newVendor, setNewVendor] = useState({ name: '', taxId: '', contact: '', address: '' });
   const [chatOpen, setChatOpen] = useState(false);
+
+  useEffect(() => {
+    setPageCache('vendors', {
+      selectedVendor,
+      selectedVendorDetails,
+      searchQuery,
+      vendors,
+      stats,
+      error,
+    });
+  }, [selectedVendor, selectedVendorDetails, searchQuery, vendors, stats, error]);
 
   const refreshVendors = async () => {
     try {
