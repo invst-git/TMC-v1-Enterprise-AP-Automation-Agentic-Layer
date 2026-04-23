@@ -312,6 +312,78 @@ def _find_matching_pending_authorization_request(
     return None
 
 
+def _find_matching_routable_authorization_request(
+    dependencies: Dict[str, Any],
+    *,
+    invoice_ids: List[str],
+    currency: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    requests = dependencies["list_payment_authorization_requests"](
+        approval_status=None,
+        risk_level=None,
+        limit=500,
+    )
+    matching_requests = [
+        request_record
+        for request_record in requests
+        if request_record.get("approval_status") in {"pending_approval", "approved", "payment_intent_created"}
+        and _matches_authorization_batch(
+            request_record,
+            invoice_ids=invoice_ids,
+            currency=currency,
+        )
+    ]
+    for status in ("payment_intent_created", "approved", "pending_approval"):
+        for request_record in matching_requests:
+            if request_record.get("approval_status") == status:
+                return request_record
+    return None
+
+
+def _mark_duplicate_pending_authorizations_superseded(
+    dependencies: Dict[str, Any],
+    *,
+    active_request_id: str,
+    invoice_ids: List[str],
+    currency: Optional[str] = None,
+    actor: Optional[str] = None,
+) -> None:
+    requests = dependencies["list_payment_authorization_requests"](
+        approval_status=None,
+        risk_level=None,
+        limit=500,
+    )
+    for request_record in requests:
+        if str(request_record.get("id") or "") == str(active_request_id):
+            continue
+        if str(request_record.get("approval_status") or "").strip().lower() != "pending_approval":
+            continue
+        if not _matches_authorization_batch(
+            request_record,
+            invoice_ids=invoice_ids,
+            currency=currency,
+        ):
+            continue
+        dependencies["update_payment_authorization_request"](
+            request_record["id"],
+            metadata={
+                "superseded_by_request_id": active_request_id,
+                "superseded_by_actor": actor,
+                "superseded": True,
+            },
+        )
+        if request_record.get("review_item_id"):
+            dependencies["update_human_review_item"](
+                request_record["review_item_id"],
+                status="dismissed",
+                resolution="superseded",
+                metadata={
+                    "superseded_by_request_id": active_request_id,
+                    "superseded_by_actor": actor,
+                },
+            )
+
+
 def _existing_pending_authorization_payload(
     request_record: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -320,6 +392,21 @@ def _existing_pending_authorization_payload(
         "authorization_request_id": request_record["id"],
         "authorization_request": request_record,
         "analysis": _analysis_from_request_record(request_record),
+        "reused_existing_request": True,
+    }
+
+
+def _existing_payment_intent_payload(
+    request_record: Dict[str, Any],
+) -> Dict[str, Any]:
+    metadata = request_record.get("metadata") or {}
+    payment_result = metadata.get("execution_result") or {}
+    return {
+        "status": "payment_intent_created",
+        "authorization_request_id": request_record["id"],
+        "authorization_request": request_record,
+        "analysis": _analysis_from_request_record(request_record),
+        "payment_result": payment_result,
         "reused_existing_request": True,
     }
 
@@ -657,13 +744,47 @@ def evaluate_and_route_payment_batch(
 ) -> Dict[str, Any]:
     dependencies = _get_dependencies()
     unique_invoice_ids = _unique_invoice_ids(invoice_ids)
-    existing_request = _find_matching_pending_authorization_request(
+    existing_request = _find_matching_routable_authorization_request(
         dependencies,
         invoice_ids=unique_invoice_ids,
         currency=currency,
     )
     if existing_request:
-        return _existing_pending_authorization_payload(existing_request)
+        existing_status = str(existing_request.get("approval_status") or "").strip().lower()
+        if existing_status == "pending_approval":
+            return _existing_pending_authorization_payload(existing_request)
+        if existing_status == "approved":
+            _mark_duplicate_pending_authorizations_superseded(
+                dependencies,
+                active_request_id=existing_request["id"],
+                invoice_ids=unique_invoice_ids,
+                currency=currency,
+                actor=requested_by,
+            )
+            updated_request = dependencies["update_payment_authorization_request"](
+                existing_request["id"],
+                customer=customer or {},
+                save_method=bool(save_method),
+                metadata={"reused_existing_request": True},
+            ) or existing_request
+            execution_result = execute_payment_authorization(updated_request["id"])
+            return {
+                "status": "approved_execution",
+                "authorization_request_id": updated_request["id"],
+                "authorization_request": execution_result["authorization_request"],
+                "analysis": _analysis_from_request_record(updated_request),
+                "payment_result": execution_result["payment_result"],
+                "reused_existing_request": True,
+            }
+        if existing_status == "payment_intent_created":
+            _mark_duplicate_pending_authorizations_superseded(
+                dependencies,
+                active_request_id=existing_request["id"],
+                invoice_ids=unique_invoice_ids,
+                currency=currency,
+                actor=requested_by,
+            )
+            return _existing_payment_intent_payload(existing_request)
     invoices = _load_batch_invoices(unique_invoice_ids)
     analysis = _analyze_payment_batch(invoice_ids, invoices, currency)
     request_record = _create_authorization_request(
@@ -750,6 +871,13 @@ def approve_payment_authorization(request_id: str, *, approved_by: str) -> Dict[
         approved_at=approved_at,
         metadata={"approved_by": approved_by},
     ) or request_record
+    _mark_duplicate_pending_authorizations_superseded(
+        dependencies,
+        active_request_id=request_id,
+        invoice_ids=request_record.get("invoice_ids") or [],
+        currency=request_record.get("currency"),
+        actor=approved_by,
+    )
     dependencies["set_workflow_state"](
         "payment_authorization",
         request_id,
@@ -957,13 +1085,47 @@ def _submit_payment_task_and_wait(
         return completed_task.get("result")
     if task_type in {"payment.authorize", "payment.route"}:
         dependencies = _get_dependencies()
-        existing_request = _find_matching_pending_authorization_request(
+        existing_request = _find_matching_routable_authorization_request(
             dependencies,
             invoice_ids=payload.get("invoice_ids") or [],
             currency=payload.get("currency"),
         )
         if existing_request:
-            return _existing_pending_authorization_payload(existing_request)
+            existing_status = str(existing_request.get("approval_status") or "").strip().lower()
+            if existing_status == "pending_approval":
+                return _existing_pending_authorization_payload(existing_request)
+            if existing_status == "approved":
+                _mark_duplicate_pending_authorizations_superseded(
+                    dependencies,
+                    active_request_id=existing_request["id"],
+                    invoice_ids=payload.get("invoice_ids") or [],
+                    currency=payload.get("currency"),
+                    actor=payload.get("requested_by"),
+                )
+                updated_request = dependencies["update_payment_authorization_request"](
+                    existing_request["id"],
+                    customer=payload.get("customer") or {},
+                    save_method=bool(payload.get("save_method")),
+                    metadata={"reused_existing_request": True},
+                ) or existing_request
+                execution_result = execute_payment_authorization(updated_request["id"])
+                return {
+                    "status": "approved_execution",
+                    "authorization_request_id": updated_request["id"],
+                    "authorization_request": execution_result["authorization_request"],
+                    "analysis": _analysis_from_request_record(updated_request),
+                    "payment_result": execution_result["payment_result"],
+                    "reused_existing_request": True,
+                }
+            if existing_status == "payment_intent_created":
+                _mark_duplicate_pending_authorizations_superseded(
+                    dependencies,
+                    active_request_id=existing_request["id"],
+                    invoice_ids=payload.get("invoice_ids") or [],
+                    currency=payload.get("currency"),
+                    actor=payload.get("requested_by"),
+                )
+                return _existing_payment_intent_payload(existing_request)
     _raise_for_task_failure(
         completed_task,
         "Payment routing is still being evaluated. Please wait a moment and try again.",

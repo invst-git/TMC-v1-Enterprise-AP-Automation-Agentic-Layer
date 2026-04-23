@@ -1,4 +1,5 @@
 import os
+import json
 import hashlib
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
@@ -37,6 +38,17 @@ def _set_invoice_workflow_state_best_effort(
         )
     except Exception:
         return None
+
+
+def _json_value(value: Any, default: Any) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return default
+    return value
 
 
 def _assert_payment_tables(cur) -> None:
@@ -320,6 +332,171 @@ def create_payment_intent_for_invoices(
                 },
             )
             return result
+
+
+def list_pending_payment_confirmations(limit: int = 25) -> List[Dict[str, Any]]:
+    limit = max(1, min(int(limit), 100))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            _assert_payment_tables(cur)
+            cur.execute("SELECT to_regclass('public.payment_authorization_requests')")
+            payment_authorization_table = cur.fetchone()
+            if not payment_authorization_table or payment_authorization_table[0] is None:
+                return []
+
+            cur.execute(
+                """
+                SELECT
+                  par.id,
+                  par.invoice_ids,
+                  par.customer,
+                  par.currency,
+                  par.total_amount,
+                  par.invoice_count,
+                  par.metadata,
+                  par.executed_payment_intent_id,
+                  p.status
+                FROM payment_authorization_requests AS par
+                INNER JOIN payments AS p
+                  ON p.stripe_payment_intent_id = par.executed_payment_intent_id
+                WHERE par.approval_status = 'payment_intent_created'
+                  AND p.status = 'requires_confirmation'
+                ORDER BY p.created_at DESC, par.created_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+
+            confirmations: List[Dict[str, Any]] = []
+            for row in cur.fetchall():
+                metadata = _json_value(row[6], {})
+                payment_result = metadata.get("execution_result") or {}
+                customer = _json_value(row[2], {})
+                invoice_ids = _json_value(row[1], [])
+                invoice_summaries = metadata.get("invoice_summaries") or []
+                vendor_names = list(
+                    dict.fromkeys(
+                        [
+                            str(invoice.get("supplier_name") or invoice.get("vendor_name") or "").strip()
+                            for invoice in invoice_summaries
+                            if str(invoice.get("supplier_name") or invoice.get("vendor_name") or "").strip()
+                        ]
+                    )
+                )
+                primary_vendor_name = (
+                    vendor_names[0]
+                    if len(vendor_names) == 1
+                    else f"{len(vendor_names)} vendors" if vendor_names else "Unknown Vendor"
+                )
+
+                confirmations.append(
+                    {
+                        "authorizationRequestId": str(row[0]),
+                        "invoiceIds": invoice_ids,
+                        "customer": customer,
+                        "currency": row[3] or payment_result.get("currency") or "USD",
+                        "totalAmount": float(row[4]) if row[4] is not None else None,
+                        "invoiceCount": int(row[5] or len(invoice_ids)),
+                        "paymentResult": payment_result,
+                        "paymentIntentId": row[7] or payment_result.get("paymentIntentId"),
+                        "clientSecret": payment_result.get("clientSecret"),
+                        "paymentStatus": row[8] or "requires_confirmation",
+                        "vendorNames": vendor_names,
+                        "primaryVendorName": primary_vendor_name,
+                    }
+                )
+
+            return confirmations
+
+
+def list_payment_history(
+    limit: int = 25,
+    *,
+    vendor_id: Optional[str] = None,
+    currency: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    limit = max(1, min(int(limit), 100))
+    vendor_id = str(vendor_id).strip() if vendor_id else None
+    currency = str(currency).strip() if currency else None
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            _assert_payment_tables(cur)
+            cur.execute(
+                """
+                SELECT
+                  p.id,
+                  p.stripe_payment_intent_id,
+                  p.amount,
+                  p.currency,
+                  p.customer_email,
+                  p.status,
+                  p.created_at,
+                  COUNT(DISTINCT pi.invoice_id) AS invoice_count,
+                  COALESCE(array_remove(array_agg(DISTINCT COALESCE(v.name, i.supplier_name)), NULL), ARRAY[]::text[]) AS vendor_names,
+                  COALESCE(array_remove(array_agg(DISTINCT i.invoice_number), NULL), ARRAY[]::text[]) AS invoice_numbers,
+                  COALESCE(array_remove(array_agg(DISTINCT pi.invoice_id::text), NULL), ARRAY[]::text[]) AS invoice_ids
+                FROM payments AS p
+                LEFT JOIN payment_invoices AS pi
+                  ON pi.payment_id = p.id
+                LEFT JOIN invoices AS i
+                  ON i.id = pi.invoice_id
+                LEFT JOIN vendors AS v
+                  ON v.id = i.vendor_id
+                WHERE (%s::text IS NULL OR lower(coalesce(p.currency, '')) = lower(%s::text))
+                  AND (
+                    %s::uuid IS NULL
+                    OR EXISTS (
+                      SELECT 1
+                      FROM payment_invoices AS pi_filter
+                      INNER JOIN invoices AS i_filter
+                        ON i_filter.id = pi_filter.invoice_id
+                      WHERE pi_filter.payment_id = p.id
+                        AND i_filter.vendor_id = %s::uuid
+                    )
+                  )
+                GROUP BY
+                  p.id,
+                  p.stripe_payment_intent_id,
+                  p.amount,
+                  p.currency,
+                  p.customer_email,
+                  p.status,
+                  p.created_at
+                ORDER BY p.created_at DESC
+                LIMIT %s
+                """,
+                (currency, currency, vendor_id, vendor_id, limit),
+            )
+
+            history: List[Dict[str, Any]] = []
+            for row in cur.fetchall():
+                vendor_names = [str(name).strip() for name in (row[8] or []) if str(name or "").strip()]
+                invoice_numbers = [str(number).strip() for number in (row[9] or []) if str(number or "").strip()]
+                invoice_ids = [str(invoice_id).strip() for invoice_id in (row[10] or []) if str(invoice_id or "").strip()]
+                primary_vendor_name = (
+                    vendor_names[0]
+                    if len(vendor_names) == 1
+                    else f"{len(vendor_names)} vendors" if vendor_names else "Unknown Vendor"
+                )
+                history.append(
+                    {
+                        "paymentId": str(row[0]),
+                        "paymentIntentId": row[1],
+                        "amount": float(row[2]) if row[2] is not None else None,
+                        "currency": row[3] or "USD",
+                        "customerEmail": row[4],
+                        "status": row[5] or "unknown",
+                        "createdAt": row[6].isoformat() if row[6] is not None else None,
+                        "invoiceCount": int(row[7] or len(invoice_ids)),
+                        "vendorNames": vendor_names,
+                        "primaryVendorName": primary_vendor_name,
+                        "invoiceNumbers": invoice_numbers,
+                        "invoiceIds": invoice_ids,
+                    }
+                )
+
+            return history
 
 
 def mark_payment_succeeded(payment_intent_id: str) -> None:

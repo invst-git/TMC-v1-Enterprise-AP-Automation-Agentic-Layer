@@ -1,12 +1,54 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import Sidebar from '../components/Sidebar';
-import { fetchPayableInvoices, fetchVendors, formatCurrency, getStatusLabel, routePaymentBatch, confirmPayment, cancelPayment } from '../services/api';
+import {
+  fetchPayableInvoices,
+  fetchPendingPaymentConfirmations,
+  fetchPaymentHistory,
+  fetchVendors,
+  formatCurrency,
+  getStatusLabel,
+  routePaymentBatch,
+  confirmPayment,
+  cancelPayment,
+} from '../services/api';
 import { loadStripe } from '@stripe/stripe-js';
 import { Elements, CardElement, useElements, useStripe } from '@stripe/react-stripe-js';
 import { useLiveRefresh } from '../lib/useLiveRefresh';
 import { getPageCache, setPageCache } from '../lib/pageCache';
 
 const stripePromise = loadStripe(process.env.REACT_APP_STRIPE_PUBLISHABLE_KEY || '');
+
+const formatPaymentDateTime = (value) => {
+  if (!value) return 'Unknown';
+  try {
+    return new Intl.DateTimeFormat('en-US', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    }).format(new Date(value));
+  } catch (_) {
+    return String(value);
+  }
+};
+
+const getPaymentStatusMeta = (status) => {
+  const normalized = String(status || '').toLowerCase();
+  if (normalized === 'succeeded') {
+    return { label: 'Succeeded', className: 'bg-green-50 text-green-700 border-green-200' };
+  }
+  if (normalized === 'requires_confirmation') {
+    return { label: 'Awaiting Card Confirmation', className: 'bg-amber-50 text-amber-700 border-amber-200' };
+  }
+  if (normalized === 'failed') {
+    return { label: 'Failed', className: 'bg-red-50 text-red-700 border-red-200' };
+  }
+  if (normalized === 'canceled') {
+    return { label: 'Canceled', className: 'bg-gray-100 text-gray-700 border-gray-200' };
+  }
+  return { label: status || 'Unknown', className: 'bg-gray-100 text-gray-700 border-gray-200' };
+};
 
 const PayerForm = ({ onSubmit, disabled }) => {
   const [email, setEmail] = useState('');
@@ -38,12 +80,43 @@ const PayerForm = ({ onSubmit, disabled }) => {
   );
 };
 
-const PayBox = ({ selection, currency, onPaid, onError, onApprovalPending, customer, payerReady }) => {
+const PayBox = ({ selection, currency, pendingConfirmations = [], onPaid, onError, onApprovalPending, customer, payerReady }) => {
   const stripe = useStripe();
   const elements = useElements();
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const total = selection.reduce((acc, s) => acc + (s.amount || 0), 0);
+
+  const confirmExistingIntent = async ({ clientSecret, paymentIntentId, billingCustomer }) => {
+    if (!clientSecret) throw new Error('No client secret');
+    if (!stripe || !elements) throw new Error('Payment card details are not ready yet. Please try again.');
+    const result = await stripe.confirmCardPayment(clientSecret, {
+      payment_method: {
+        card: elements.getElement(CardElement),
+        billing_details: billingCustomer,
+      }
+    });
+    if (result.error) {
+      setError(result.error.message || 'Payment failed');
+      if (paymentIntentId) {
+        try { await cancelPayment({ paymentIntentId }); } catch (_) {}
+      }
+      if (onError) onError(result.error.message || 'Payment failed');
+      return;
+    }
+    if (result.paymentIntent && result.paymentIntent.status === 'succeeded') {
+      try {
+        await confirmPayment({ paymentIntentId: result.paymentIntent.id });
+      } catch (_) {}
+      onPaid(result.paymentIntent.id);
+      return;
+    }
+    setError('Payment not completed.');
+    if (paymentIntentId) {
+      try { await cancelPayment({ paymentIntentId }); } catch (_) {}
+    }
+    if (onError) onError('Payment not completed.');
+  };
 
   const handlePay = async () => {
     setSubmitting(true);
@@ -71,31 +144,11 @@ const PayBox = ({ selection, currency, onPaid, onError, onApprovalPending, custo
       const paymentResult = routeResult?.payment_result || routeResult?.paymentResult || routeResult;
       const { clientSecret, paymentIntentId, error: serverError } = paymentResult || {};
       if (!clientSecret) throw new Error(serverError || 'No client secret');
-      if (!stripe || !elements) throw new Error('Payment card details are not ready yet. Please try again.');
-      const result = await stripe.confirmCardPayment(clientSecret, {
-        payment_method: {
-          card: elements.getElement(CardElement),
-          billing_details: customer,
-        }
+      await confirmExistingIntent({
+        clientSecret,
+        paymentIntentId,
+        billingCustomer: customer,
       });
-      if (result.error) {
-        setError(result.error.message || 'Payment failed');
-        if (paymentIntentId) {
-          try { await cancelPayment({ paymentIntentId }); } catch (_) {}
-        }
-        if (onError) onError(result.error.message || 'Payment failed');
-      } else if (result.paymentIntent && result.paymentIntent.status === 'succeeded') {
-        try {
-          await confirmPayment({ paymentIntentId: result.paymentIntent.id });
-        } catch (_) {}
-        onPaid(result.paymentIntent.id);
-      } else {
-        setError('Payment not completed.');
-        if (paymentIntentId) {
-          try { await cancelPayment({ paymentIntentId }); } catch (_) {}
-        }
-        if (onError) onError('Payment not completed.');
-      }
     } catch (e) {
       const message = e?.message || 'We could not complete that request. Please try again.';
       const lowered = String(message).toLowerCase();
@@ -111,14 +164,60 @@ const PayBox = ({ selection, currency, onPaid, onError, onApprovalPending, custo
     }
   };
 
+  const handleResumePending = async (confirmation) => {
+    setSubmitting(true);
+    setError('');
+    try {
+      await confirmExistingIntent({
+        clientSecret: confirmation.clientSecret || confirmation?.paymentResult?.clientSecret,
+        paymentIntentId: confirmation.paymentIntentId || confirmation?.paymentResult?.paymentIntentId,
+        billingCustomer: (payerReady ? customer : null) || confirmation.customer || {},
+      });
+    } catch (e) {
+      const message = e?.message || 'We could not resume that payment. Please try again.';
+      setError(message);
+      if (onError) onError(message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   return (
     <div className="space-y-3">
       <div className="p-3 border border-gray-200 rounded">
         <CardElement options={{ hidePostalCode: true }} />
       </div>
+      {pendingConfirmations.length > 0 && (
+        <div className="space-y-2">
+          <div className="text-xs font-medium uppercase tracking-[0.14em] text-gray-500">Pending Payment Confirmations</div>
+          {pendingConfirmations.map((confirmation) => (
+            <div key={confirmation.authorizationRequestId} className="border border-amber-200 bg-amber-50 rounded-lg p-3">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium text-black">{confirmation.primaryVendorName || 'Unknown Vendor'}</div>
+                  <div className="text-xs text-gray-600 mt-1">
+                    {formatCurrency(confirmation.totalAmount || 0)} ({confirmation.currency || 'USD'}) · {confirmation.invoiceCount || 0} invoice{Number(confirmation.invoiceCount || 0) === 1 ? '' : 's'}
+                  </div>
+                  <div className="text-xs text-gray-600 mt-1 break-all">
+                    Authorization {confirmation.authorizationRequestId}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  disabled={submitting || !confirmation.clientSecret}
+                  className="px-3 py-2 bg-black text-white rounded-lg text-xs font-medium hover:bg-gray-800 disabled:opacity-60"
+                  onClick={() => handleResumePending(confirmation)}
+                >
+                  Resume payment
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
       {!payerReady && (
         <div className="text-xs text-amber-700">
-          Save the payer details before starting payment or approval routing.
+          Save the payer details before starting payment or approval routing. Pending confirmations can also use the stored payer details from the authorization request.
         </div>
       )}
       {error && <div className="text-sm text-red-600">{error}</div>}
@@ -137,6 +236,8 @@ const Payments = () => {
   const [selectedVendorId, setSelectedVendorId] = useState(cache?.selectedVendorId || '');
   const [currency, setCurrency] = useState(cache?.currency || '');
   const [items, setItems] = useState(cache?.items || []);
+  const [pendingConfirmations, setPendingConfirmations] = useState(cache?.pendingConfirmations || []);
+  const [paymentHistory, setPaymentHistory] = useState(cache?.paymentHistory || []);
   const [loading, setLoading] = useState(!cache);
   const [error, setError] = useState(cache?.error || null);
   const [selected, setSelected] = useState({});
@@ -151,9 +252,11 @@ const Payments = () => {
       selectedVendorId,
       currency,
       items,
+      pendingConfirmations,
+      paymentHistory,
       error,
     });
-  }, [vendors, selectedVendorId, currency, items, error]);
+  }, [vendors, selectedVendorId, currency, items, pendingConfirmations, paymentHistory, error]);
 
   const grouped = useMemo(() => {
     const map = new Map();
@@ -171,6 +274,14 @@ const Payments = () => {
     const set = new Set(selectionArray.map(i => i.currency).filter(Boolean));
     return set.size === 1 ? selectionArray[0]?.currency : '';
   }, [selectionArray]);
+  const pendingVendorSummary = useMemo(() => {
+    const names = Array.from(new Set(
+      pendingConfirmations
+        .map((item) => item.primaryVendorName)
+        .filter(Boolean)
+    ));
+    return names.join(', ');
+  }, [pendingConfirmations]);
   const payerReady = Boolean(customer?.email && customer?.name);
 
   const load = async () => {
@@ -178,12 +289,16 @@ const Payments = () => {
       if (!items.length && !vendors.length) {
         setLoading(true);
       }
-      const [vData, invData] = await Promise.all([
+      const [vData, invData, pendingData, historyData] = await Promise.all([
         fetchVendors(),
-        fetchPayableInvoices({ vendorId: selectedVendorId || undefined, currency: currency || undefined, limit: 200 })
+        fetchPayableInvoices({ vendorId: selectedVendorId || undefined, currency: currency || undefined, limit: 200 }),
+        fetchPendingPaymentConfirmations({ limit: 20 }),
+        fetchPaymentHistory({ vendorId: selectedVendorId || undefined, currency: currency || undefined, limit: 20 }),
       ]);
       setVendors(vData);
       setItems(invData);
+      setPendingConfirmations(pendingData);
+      setPaymentHistory(historyData);
       setSelected((current) => {
         const next = { ...current };
         const allowed = new Set(invData.map((item) => item.id));
@@ -243,10 +358,31 @@ const Payments = () => {
             <p className="text-sm text-red-600">{error}</p>
           </div>
         )}
+        {pendingConfirmations.length > 0 && (
+          <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 mb-6">
+            <p className="text-sm font-medium text-amber-900">
+              {pendingConfirmations.length} payment{pendingConfirmations.length === 1 ? '' : 's'} {pendingConfirmations.length === 1 ? 'is' : 'are'} waiting for card confirmation.
+            </p>
+            <p className="text-sm text-amber-800 mt-1">
+              These invoices are no longer in the payable list because they are already in `payment_pending`. Resume them from the Payment Method panel on the right.
+              {pendingVendorSummary ? ` Vendors: ${pendingVendorSummary}.` : ''}
+            </p>
+          </div>
+        )}
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
           {/* Invoices list (2/3) */}
           <div className="lg:col-span-2 space-y-4">
+            {!loading && grouped.length === 0 && (
+              <div className="bg-gray-50 border border-gray-200 rounded-xl p-4">
+                <p className="text-sm text-gray-700">No invoices are currently eligible for a new payment.</p>
+                {pendingConfirmations.length > 0 && (
+                  <p className="text-sm text-gray-600 mt-1">
+                    There {pendingConfirmations.length === 1 ? 'is' : 'are'} {pendingConfirmations.length} payment{pendingConfirmations.length === 1 ? '' : 's'} awaiting confirmation in the Payment Method panel.
+                  </p>
+                )}
+              </div>
+            )}
             {grouped.map(group => (
               <div key={group.vendorId} className="bg-white border border-gray-200 rounded-xl overflow-hidden">
                 <div className="p-3 sm:p-4 flex items-center justify-between border-b border-gray-200">
@@ -309,6 +445,7 @@ const Payments = () => {
                 <PayBox
                   selection={selectionArray}
                   currency={selectionCurrency || currency || 'USD'}
+                  pendingConfirmations={pendingConfirmations}
                   onPaid={() => {
                     setPaid(true);
                     setPayError('');
@@ -344,6 +481,54 @@ const Payments = () => {
               <div className="p-3 bg-red-50 border border-red-200 rounded text-sm text-red-700">{payError}</div>
             )}
           </div>
+        </div>
+
+        <div className="bg-white border border-gray-200 rounded-xl p-4 sm:p-6 mt-4">
+          <div className="flex items-center justify-between gap-3 mb-4">
+            <div>
+              <h2 className="text-base font-medium text-black">Payment History</h2>
+              <p className="text-sm text-gray-600 mt-1">Recent payment attempts and completed payments for the current filter.</p>
+            </div>
+          </div>
+          {paymentHistory.length === 0 ? (
+            <p className="text-sm text-gray-600">No payment history found for the current filters.</p>
+          ) : (
+            <div className="space-y-3">
+              {paymentHistory.map((payment) => {
+                const statusMeta = getPaymentStatusMeta(payment.status);
+                return (
+                  <div key={payment.paymentId} className="border border-gray-200 rounded-xl p-4">
+                    <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-3">
+                      <div className="space-y-2">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <div className="text-sm font-medium text-black">{payment.primaryVendorName || 'Unknown Vendor'}</div>
+                          <span className={`inline-flex items-center rounded-full border px-2 py-1 text-xs font-medium ${statusMeta.className}`}>
+                            {statusMeta.label}
+                          </span>
+                        </div>
+                        <div className="text-xs text-gray-600">
+                          {payment.invoiceCount || 0} invoice{Number(payment.invoiceCount || 0) === 1 ? '' : 's'}
+                          {payment.invoiceNumbers?.length ? ` / ${payment.invoiceNumbers.join(', ')}` : ''}
+                        </div>
+                        <div className="text-xs text-gray-600">
+                          Payer: {payment.customerEmail || 'Unknown'} / Created: {formatPaymentDateTime(payment.createdAt)}
+                        </div>
+                        {payment.paymentIntentId && (
+                          <div className="text-xs text-gray-500 break-all">
+                            Payment Intent: {payment.paymentIntentId}
+                          </div>
+                        )}
+                      </div>
+                      <div className="text-left lg:text-right">
+                        <div className="text-base font-semibold text-black">{formatCurrency(payment.amount || 0)}</div>
+                        <div className="text-xs text-gray-600 mt-1">{String(payment.currency || 'USD').toUpperCase()}</div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       </div>
     </div>

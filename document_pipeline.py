@@ -183,6 +183,24 @@ def _process_saved_invoice_file_sync_from_segments(
             )
             if segment_update_warning:
                 logs.append(f"Source segment linkage skipped for {label}: {segment_update_warning}")
+            if validation.review_item_id:
+                try:
+                    from agent_db import update_human_review_item
+
+                    update_human_review_item(
+                        validation.review_item_id,
+                        invoice_id=invoice_id,
+                        metadata={
+                            "persistence": {
+                                "invoice_id": invoice_id,
+                                "invoice_status": save_result.status,
+                                "decision": validation.decision,
+                            },
+                            "extracted_fields": validation.extracted_fields or {},
+                        },
+                    )
+                except Exception as exc:
+                    logs.append(f"Review item linkage skipped for {label}: {get_user_facing_message(exc)}")
             publish_live_update(
                 "invoice.persisted",
                 {

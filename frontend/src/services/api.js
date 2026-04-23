@@ -259,6 +259,22 @@ export const fetchPayableInvoices = async ({ vendorId, currency, limit = 200 } =
   return await handleResponse(response);
 };
 
+export const fetchPendingPaymentConfirmations = async ({ limit = 25 } = {}) => {
+  const params = new URLSearchParams();
+  if (limit) params.set('limit', String(limit));
+  const response = await fetch(`/api/payments/pending-confirmations?${params.toString()}`);
+  return await handleResponse(response);
+};
+
+export const fetchPaymentHistory = async ({ vendorId, currency, limit = 25 } = {}) => {
+  const params = new URLSearchParams();
+  if (vendorId) params.set('vendor_id', vendorId);
+  if (currency) params.set('currency', currency);
+  if (limit) params.set('limit', String(limit));
+  const response = await fetch(`/api/payments/history?${params.toString()}`);
+  return await handleResponse(response);
+};
+
 export const fetchAgentOverview = async () => {
   const response = await fetch(`${API_BASE_URL}/agent/overview`);
   return await handleResponse(response);

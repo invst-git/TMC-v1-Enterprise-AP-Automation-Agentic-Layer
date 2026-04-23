@@ -11,10 +11,12 @@ import {
 } from 'lucide-react';
 import Sidebar from '../components/Sidebar';
 import {
+  approvePaymentAuthorization,
   assignAgentReviewItem,
   fetchAgentReviewQueue,
   formatCurrency,
   rejectAgentReviewItem,
+  rejectPaymentAuthorization,
   resolveAgentReviewItem,
 } from '../services/api';
 import { useLiveRefresh } from '../lib/useLiveRefresh';
@@ -85,9 +87,20 @@ const formatTimestamp = (value) => {
   });
 };
 
+const hasDisplayValue = (value) => value !== null && value !== undefined && value !== '';
+const hasNumericValue = (value) => hasDisplayValue(value) && !Number.isNaN(Number(value));
+
 const formatConfidence = (value) => {
-  const numericValue = Number(value || 0);
+  const numericValue = Number(value);
   return `${Math.round(Math.max(0, Math.min(1, numericValue)) * 100)}%`;
+};
+
+const formatReviewStatus = (value) => {
+  const text = String(value || '').trim();
+  if (!text) return 'Unknown';
+  return text
+    .replace(/[_-]+/g, ' ')
+    .replace(/\b\w/g, (char) => char.toUpperCase());
 };
 
 const formatAttemptPath = (pathName) => {
@@ -148,6 +161,9 @@ const analysisLabel = (analysis) => {
   if (!reason) return decision;
   return `${decision} - ${reason}`;
 };
+
+const analysisMessage = (analysis) =>
+  String(analysis?.summary || analysis?.message || analysis?.reasoning_summary || '').trim();
 
 const ReviewQueue = () => {
   const cache = getPageCache('review-queue');
@@ -342,6 +358,48 @@ const ReviewQueue = () => {
               const canSubmit = Boolean(String(reviewerValue).trim() && String(notesValue).trim());
               const selectedPoId = selectedPoById[item.id] || candidatePos[0]?.po_id || '';
               const invoiceSummary = item.invoice_summary || {};
+              const metadata = item.metadata || {};
+              const issues = Array.isArray(metadata.issues) ? metadata.issues : [];
+              const isExtractionValidationItem = item.queue_name === 'extraction_validation';
+              const isPaymentAuthorizationItem = item.entity_type === 'payment_authorization' || item.queue_name === 'payment_authorization';
+              const paymentAuthorization = item.payment_authorization_summary || {};
+              const initialAnalysis = resolutionPacket.initial_analysis || null;
+              const finalAnalysis = resolutionPacket.final_analysis || null;
+              const initialAnalysisLabel = initialAnalysis
+                ? analysisLabel(initialAnalysis)
+                : (
+                  isPaymentAuthorizationItem
+                    ? `${formatReviewStatus(paymentAuthorization.risk_level)} Risk Batch`
+                    : (isExtractionValidationItem ? item.review_reason_label : 'Unavailable')
+                );
+              const finalAnalysisLabel = finalAnalysis
+                ? analysisLabel(finalAnalysis)
+                : (
+                  isPaymentAuthorizationItem
+                    ? formatReviewStatus(paymentAuthorization.approval_status || 'pending_approval')
+                    : (isExtractionValidationItem ? (invoiceSummary.status || 'Needs review') : 'Unavailable')
+                );
+              const initialAnalysisMessage = analysisMessage(initialAnalysis)
+                || (
+                  isPaymentAuthorizationItem
+                    ? `Batch total ${hasNumericValue(paymentAuthorization.total_amount) ? formatCurrency(paymentAuthorization.total_amount) : 'Unknown'} across ${paymentAuthorization.invoice_count || 0} invoice${Number(paymentAuthorization.invoice_count || 0) === 1 ? '' : 's'}.`
+                    : ''
+                )
+                || (isExtractionValidationItem ? (issues[0]?.message || item.recommended_action) : '');
+              const finalAnalysisMessage = analysisMessage(finalAnalysis)
+                || (
+                  isPaymentAuthorizationItem
+                    ? `Risk reasons: ${(paymentAuthorization.risk_reasons || []).join(', ') || 'None recorded.'}`
+                    : ''
+                )
+                || (isExtractionValidationItem ? item.recommended_action : '');
+              const showsPoMatchingDetails = Boolean(
+                attempts.length
+                || candidatePos.length
+                || item.queue_name === 'po_matching'
+                || initialAnalysis
+                || finalAnalysis,
+              );
               const actionError = actionErrorById[item.id];
               const isBusy = actionState.itemId === item.id;
 
@@ -366,10 +424,14 @@ const ReviewQueue = () => {
                           </span>
                         </div>
                         <h2 className="text-lg font-semibold text-black">
-                          {invoiceSummary.invoice_number || item.invoice_id || item.id}
+                          {isPaymentAuthorizationItem
+                            ? `Authorization ${item.entity_id || item.id}`
+                            : (invoiceSummary.invoice_number || item.invoice_id || item.id)}
                         </h2>
                         <p className="text-sm text-gray-600 mt-1">
-                          {item.review_reason_label} for {invoiceSummary.vendor_name || invoiceSummary.supplier_name || 'Unknown vendor'}
+                          {isPaymentAuthorizationItem
+                            ? `${item.review_reason_label} for ${invoiceSummary.vendor_name || 'payment batch'}`
+                            : `${item.review_reason_label} for ${invoiceSummary.vendor_name || invoiceSummary.supplier_name || 'Unknown vendor'}`}
                         </p>
                       </div>
 
@@ -407,35 +469,79 @@ const ReviewQueue = () => {
                           <div className="bg-white border border-gray-200 rounded-2xl p-4">
                             <div className="flex items-center gap-2 mb-4">
                               <FileSearch className="w-4 h-4 text-gray-500" />
-                              <h3 className="text-sm font-semibold text-black">Invoice Summary</h3>
+                              <h3 className="text-sm font-semibold text-black">
+                                {isPaymentAuthorizationItem ? 'Payment Authorization Summary' : 'Invoice Summary'}
+                              </h3>
                             </div>
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
                               <div>
-                                <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">Invoice</p>
-                                <p className="text-black font-medium">{invoiceSummary.invoice_number || item.invoice_id || 'Unknown'}</p>
+                                <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">
+                                  {isPaymentAuthorizationItem ? 'Authorization' : 'Invoice'}
+                                </p>
+                                <p className="text-black font-medium">
+                                  {isPaymentAuthorizationItem ? (item.entity_id || item.id) : (invoiceSummary.invoice_number || item.invoice_id || 'Unknown')}
+                                </p>
                               </div>
                               <div>
-                                <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">Vendor</p>
+                                <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">
+                                  {isPaymentAuthorizationItem ? 'Vendor Scope' : 'Vendor'}
+                                </p>
                                 <p className="text-black font-medium">{invoiceSummary.vendor_name || invoiceSummary.supplier_name || 'Unknown'}</p>
                               </div>
                               <div>
-                                <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">Invoice Date</p>
-                                <p className="text-black">{invoiceSummary.invoice_date ? formatTimestamp(invoiceSummary.invoice_date) : 'Unknown'}</p>
+                                <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">
+                                  {isPaymentAuthorizationItem ? 'Payer' : 'Invoice Date'}
+                                </p>
+                                <p className="text-black">
+                                  {isPaymentAuthorizationItem
+                                    ? (paymentAuthorization.customer?.email || paymentAuthorization.customer?.name || 'Unknown')
+                                    : (invoiceSummary.invoice_date ? formatTimestamp(invoiceSummary.invoice_date) : 'Unknown')}
+                                </p>
                               </div>
                               <div>
-                                <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">Total</p>
-                                <p className="text-black">{formatCurrency(invoiceSummary.total_amount)}</p>
+                                <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">
+                                  {isPaymentAuthorizationItem ? 'Batch Total' : 'Total'}
+                                </p>
+                                <p className="text-black">
+                                  {hasNumericValue(invoiceSummary.total_amount) ? formatCurrency(invoiceSummary.total_amount) : 'Unknown'}
+                                </p>
                               </div>
                               <div>
-                                <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">PO Number</p>
-                                <p className="text-black">{invoiceSummary.po_number || 'Not provided'}</p>
+                                <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">
+                                  {isPaymentAuthorizationItem ? 'Invoices Included' : 'PO Number'}
+                                </p>
+                                <p className="text-black">
+                                  {isPaymentAuthorizationItem ? (paymentAuthorization.invoice_count || 0) : (invoiceSummary.po_number || 'Not provided')}
+                                </p>
                               </div>
                               <div>
-                                <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">Current Status</p>
-                                <p className="text-black">{invoiceSummary.status || 'Unknown'}</p>
+                                <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">
+                                  {isPaymentAuthorizationItem ? 'Current Status' : 'Current Status'}
+                                </p>
+                                <p className="text-black">
+                                  {isPaymentAuthorizationItem
+                                    ? formatReviewStatus(paymentAuthorization.approval_status || invoiceSummary.status)
+                                    : (invoiceSummary.status || 'Unknown')}
+                                </p>
                               </div>
                             </div>
                           </div>
+
+                          {isPaymentAuthorizationItem && (
+                            <div className="bg-white border border-gray-200 rounded-2xl p-4">
+                              <h3 className="text-sm font-semibold text-black mb-4">Risk Signals</h3>
+                              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                {Object.entries(paymentAuthorization.risk_signals || {}).map(([key, value]) => (
+                                  <div key={`${item.id}-risk-${key}`} className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">
+                                    <p className="text-[11px] uppercase tracking-[0.14em] text-gray-500 mb-1">
+                                      {key.replace(/[_-]+/g, ' ')}
+                                    </p>
+                                    <p className="text-sm text-black break-words">{formatFindingValue(value)}</p>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
 
                           <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4">
                             <div className="flex items-center gap-2 mb-2">
@@ -448,45 +554,47 @@ const ReviewQueue = () => {
                           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                             <div className="bg-white border border-gray-200 rounded-2xl p-4">
                               <p className="text-xs uppercase tracking-[0.16em] text-gray-500 mb-2">Initial Analysis</p>
-                              <p className="text-sm font-medium text-black">{analysisLabel(resolutionPacket.initial_analysis)}</p>
-                              <p className="text-sm text-gray-600 mt-2">
-                                Confidence {formatConfidence(resolutionPacket.initial_analysis?.confidence)}
-                              </p>
+                              <p className="text-sm font-medium text-black">{initialAnalysisLabel}</p>
+                              {initialAnalysisMessage && (
+                                <p className="text-sm text-gray-600 mt-2">{initialAnalysisMessage}</p>
+                              )}
+                              {hasNumericValue(initialAnalysis?.confidence) && (
+                                <p className="text-sm text-gray-600 mt-2">
+                                  Confidence {formatConfidence(initialAnalysis.confidence)}
+                                </p>
+                              )}
                             </div>
                             <div className="bg-white border border-gray-200 rounded-2xl p-4">
                               <p className="text-xs uppercase tracking-[0.16em] text-gray-500 mb-2">Final Analysis</p>
-                              <p className="text-sm font-medium text-black">{analysisLabel(resolutionPacket.final_analysis)}</p>
-                              <p className="text-sm text-gray-600 mt-2">
-                                Confidence {formatConfidence(resolutionPacket.final_analysis?.confidence)}
-                              </p>
+                              <p className="text-sm font-medium text-black">{finalAnalysisLabel}</p>
+                              {finalAnalysisMessage && (
+                                <p className="text-sm text-gray-600 mt-2">{finalAnalysisMessage}</p>
+                              )}
+                              {hasNumericValue(finalAnalysis?.confidence) && (
+                                <p className="text-sm text-gray-600 mt-2">
+                                  Confidence {formatConfidence(finalAnalysis.confidence)}
+                                </p>
+                              )}
                             </div>
                           </div>
 
-                          <div className="bg-white border border-gray-200 rounded-2xl p-4">
-                            <h3 className="text-sm font-semibold text-black mb-4">Automated Recovery Paths</h3>
-                            {attempts.length === 0 ? (
-                              <p className="text-sm text-gray-600">No automated recovery attempts were recorded for this item.</p>
-                            ) : (
+                          {isExtractionValidationItem && issues.length > 0 && (
+                            <div className="bg-white border border-gray-200 rounded-2xl p-4">
+                              <h3 className="text-sm font-semibold text-black mb-4">Detected Issues</h3>
                               <div className="space-y-3">
-                                {attempts.map((attempt, index) => (
-                                  <div key={`${item.id}-attempt-${index}`} className="border border-gray-200 rounded-xl p-4">
-                                    <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between mb-3">
-                                      <div>
-                                        <p className="text-sm font-semibold text-black">{formatAttemptPath(attempt.path_name)}</p>
-                                        <p className="text-sm text-gray-600 mt-1">{attempt.summary || 'No summary available.'}</p>
-                                      </div>
-                                      <div className="flex flex-wrap items-center gap-2">
-                                        <span className={`px-2.5 py-1 rounded-full border text-[11px] font-semibold ${attemptTone(attempt.outcome)}`}>
-                                          {formatAttemptOutcome(attempt.outcome)}
-                                        </span>
-                                        <span className="px-2.5 py-1 rounded-full border border-gray-200 text-[11px] font-semibold text-gray-700 bg-gray-50">
-                                          Confidence {formatConfidence(attempt.confidence)}
-                                        </span>
-                                      </div>
+                                {issues.map((issue, index) => (
+                                  <div key={`${item.id}-issue-${index}`} className="border border-gray-200 rounded-xl p-4">
+                                    <div className="flex flex-wrap items-center gap-2 mb-3">
+                                      <span className="px-2.5 py-1 rounded-full border border-amber-200 bg-amber-50 text-[11px] font-semibold text-amber-700">
+                                        {String(issue.severity || 'issue').replace(/[_-]+/g, ' ')}
+                                      </span>
+                                      <span className="text-sm font-medium text-black">
+                                        {issue.message || item.recommended_action}
+                                      </span>
                                     </div>
                                     <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                                      {Object.entries(attempt.findings || {}).map(([key, value]) => (
-                                        <div key={`${item.id}-${index}-${key}`} className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">
+                                      {Object.entries(issue.details || {}).map(([key, value]) => (
+                                        <div key={`${item.id}-issue-${index}-${key}`} className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">
                                           <p className="text-[11px] uppercase tracking-[0.14em] text-gray-500 mb-1">
                                             {key.replace(/[_-]+/g, ' ')}
                                           </p>
@@ -497,59 +605,103 @@ const ReviewQueue = () => {
                                   </div>
                                 ))}
                               </div>
-                            )}
-                          </div>
+                            </div>
+                          )}
 
-                          <div className="bg-white border border-gray-200 rounded-2xl p-4">
-                            <h3 className="text-sm font-semibold text-black mb-4">Candidate Purchase Orders</h3>
-                            {candidatePos.length === 0 ? (
-                              <p className="text-sm text-gray-600">No candidate purchase orders were captured for this review item.</p>
-                            ) : (
-                              <div className="space-y-3">
-                                {candidatePos.map((candidate) => {
-                                  const checked = String(selectedPoId) === String(candidate.po_id);
-                                  return (
-                                    <label
-                                      key={candidate.po_id}
-                                      className={`block rounded-xl border p-4 cursor-pointer transition-colors ${checked ? 'border-black bg-gray-50' : 'border-gray-200 bg-white hover:bg-gray-50'}`}
-                                    >
-                                      <div className="flex items-start gap-3">
-                                        <input
-                                          type="radio"
-                                          name={`candidate-po-${item.id}`}
-                                          className="mt-1"
-                                          checked={checked}
-                                          onChange={() => setSelectedPoById((current) => ({ ...current, [item.id]: candidate.po_id }))}
-                                        />
-                                        <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
-                                          <div>
-                                            <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">PO Number</p>
-                                            <p className="font-medium text-black">{candidate.po_number || candidate.po_id}</p>
-                                          </div>
-                                          <div>
-                                            <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">Similarity</p>
-                                            <p className="text-black">{formatConfidence(candidate.similarity_score)}</p>
-                                          </div>
-                                          <div>
-                                            <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">Amount Delta</p>
-                                            <p className="text-black">{formatCurrency(candidate.amount_diff)}</p>
-                                          </div>
-                                          <div>
-                                            <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">Tolerance</p>
-                                            <p className="text-black">{candidate.within_tolerance ? 'Within tolerance' : 'Outside tolerance'}</p>
-                                          </div>
-                                          <div className="md:col-span-2">
-                                            <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">Eligibility Notes</p>
-                                            <p className="text-black">{candidate.eligibility_reason || 'No additional notes.'}</p>
-                                          </div>
+                          {showsPoMatchingDetails && (
+                            <div className="bg-white border border-gray-200 rounded-2xl p-4">
+                              <h3 className="text-sm font-semibold text-black mb-4">Automated Recovery Paths</h3>
+                              {attempts.length === 0 ? (
+                                <p className="text-sm text-gray-600">No automated recovery attempts were recorded for this item.</p>
+                              ) : (
+                                <div className="space-y-3">
+                                  {attempts.map((attempt, index) => (
+                                    <div key={`${item.id}-attempt-${index}`} className="border border-gray-200 rounded-xl p-4">
+                                      <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between mb-3">
+                                        <div>
+                                          <p className="text-sm font-semibold text-black">{formatAttemptPath(attempt.path_name)}</p>
+                                          <p className="text-sm text-gray-600 mt-1">{attempt.summary || 'No summary available.'}</p>
+                                        </div>
+                                        <div className="flex flex-wrap items-center gap-2">
+                                          <span className={`px-2.5 py-1 rounded-full border text-[11px] font-semibold ${attemptTone(attempt.outcome)}`}>
+                                            {formatAttemptOutcome(attempt.outcome)}
+                                          </span>
+                                          {hasNumericValue(attempt.confidence) && (
+                                            <span className="px-2.5 py-1 rounded-full border border-gray-200 text-[11px] font-semibold text-gray-700 bg-gray-50">
+                                              Confidence {formatConfidence(attempt.confidence)}
+                                            </span>
+                                          )}
                                         </div>
                                       </div>
-                                    </label>
-                                  );
-                                })}
-                              </div>
-                            )}
-                          </div>
+                                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                        {Object.entries(attempt.findings || {}).map(([key, value]) => (
+                                          <div key={`${item.id}-${index}-${key}`} className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">
+                                            <p className="text-[11px] uppercase tracking-[0.14em] text-gray-500 mb-1">
+                                              {key.replace(/[_-]+/g, ' ')}
+                                            </p>
+                                            <p className="text-sm text-black break-words">{formatFindingValue(value)}</p>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {showsPoMatchingDetails && (
+                            <div className="bg-white border border-gray-200 rounded-2xl p-4">
+                              <h3 className="text-sm font-semibold text-black mb-4">Candidate Purchase Orders</h3>
+                              {candidatePos.length === 0 ? (
+                                <p className="text-sm text-gray-600">No candidate purchase orders were captured for this review item.</p>
+                              ) : (
+                                <div className="space-y-3">
+                                  {candidatePos.map((candidate) => {
+                                    const checked = String(selectedPoId) === String(candidate.po_id);
+                                    return (
+                                      <label
+                                        key={candidate.po_id}
+                                        className={`block rounded-xl border p-4 cursor-pointer transition-colors ${checked ? 'border-black bg-gray-50' : 'border-gray-200 bg-white hover:bg-gray-50'}`}
+                                      >
+                                        <div className="flex items-start gap-3">
+                                          <input
+                                            type="radio"
+                                            name={`candidate-po-${item.id}`}
+                                            className="mt-1"
+                                            checked={checked}
+                                            onChange={() => setSelectedPoById((current) => ({ ...current, [item.id]: candidate.po_id }))}
+                                          />
+                                          <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+                                            <div>
+                                              <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">PO Number</p>
+                                              <p className="font-medium text-black">{candidate.po_number || candidate.po_id}</p>
+                                            </div>
+                                            <div>
+                                              <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">Similarity</p>
+                                              <p className="text-black">{hasNumericValue(candidate.similarity_score) ? formatConfidence(candidate.similarity_score) : 'Unknown'}</p>
+                                            </div>
+                                            <div>
+                                              <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">Amount Delta</p>
+                                              <p className="text-black">{hasNumericValue(candidate.amount_diff) ? formatCurrency(candidate.amount_diff) : 'Unknown'}</p>
+                                            </div>
+                                            <div>
+                                              <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">Tolerance</p>
+                                              <p className="text-black">{candidate.within_tolerance ? 'Within tolerance' : 'Outside tolerance'}</p>
+                                            </div>
+                                            <div className="md:col-span-2">
+                                              <p className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-1">Eligibility Notes</p>
+                                              <p className="text-black">{candidate.eligibility_reason || 'No additional notes.'}</p>
+                                            </div>
+                                          </div>
+                                        </div>
+                                      </label>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          )}
                         </div>
 
                         <div className="space-y-5">
@@ -569,7 +721,11 @@ const ReviewQueue = () => {
                               <span className="text-xs uppercase tracking-[0.14em] text-gray-500 mb-2 block">Resolution Notes</span>
                               <textarea
                                 className="w-full min-h-[132px] border border-gray-200 rounded-xl px-3 py-2 text-sm text-black resize-y"
-                                placeholder="Explain why you are approving the match, requesting clarification, or rejecting the item."
+                                placeholder={
+                                  isPaymentAuthorizationItem
+                                    ? 'Explain why you are approving or rejecting this payment batch.'
+                                    : 'Explain why you are approving the match, requesting clarification, or rejecting the item.'
+                                }
                                 value={notesValue}
                                 onChange={(event) => setNotesById((current) => ({ ...current, [item.id]: event.target.value }))}
                               />
@@ -592,44 +748,66 @@ const ReviewQueue = () => {
                               <button
                                 type="button"
                                 className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-black text-white text-sm font-medium hover:bg-gray-900 disabled:opacity-60 disabled:cursor-not-allowed"
-                                disabled={isBusy || !canSubmit || candidatePos.length === 0}
-                                onClick={() => runItemAction(item, 'approve_match', ({ reviewer, notes }) => resolveAgentReviewItem({
-                                  reviewItemId: item.id,
-                                  reviewer,
-                                  action: 'approve_match',
-                                  resolutionNotes: notes,
-                                  selectedPoId: selectedPoId || undefined,
-                                }))}
+                                disabled={isBusy || !canSubmit || (!isPaymentAuthorizationItem && candidatePos.length === 0)}
+                                onClick={() => runItemAction(
+                                  item,
+                                  isPaymentAuthorizationItem ? 'approve_payment_authorization' : 'approve_match',
+                                  ({ reviewer, notes }) => (
+                                    isPaymentAuthorizationItem
+                                      ? approvePaymentAuthorization({ requestId: item.entity_id, approvedBy: reviewer })
+                                      : resolveAgentReviewItem({
+                                        reviewItemId: item.id,
+                                        reviewer,
+                                        action: 'approve_match',
+                                        resolutionNotes: notes,
+                                        selectedPoId: selectedPoId || undefined,
+                                      })
+                                  ),
+                                )}
                               >
                                 <CheckCircle2 className="w-4 h-4" />
-                                {isBusy && actionState.action === 'approve_match' ? 'Approving...' : 'Approve Match'}
+                                {isBusy && (actionState.action === 'approve_match' || actionState.action === 'approve_payment_authorization')
+                                  ? 'Approving...'
+                                  : (isPaymentAuthorizationItem ? 'Approve Payment Authorization' : 'Approve Match')}
                               </button>
-                              <button
-                                type="button"
-                                className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl border border-amber-300 bg-amber-50 text-amber-900 text-sm font-medium hover:bg-amber-100 disabled:opacity-60 disabled:cursor-not-allowed"
-                                disabled={isBusy || !canSubmit}
-                                onClick={() => runItemAction(item, 'request_vendor_clarification', ({ reviewer, notes }) => resolveAgentReviewItem({
-                                  reviewItemId: item.id,
-                                  reviewer,
-                                  action: 'request_vendor_clarification',
-                                  resolutionNotes: notes,
-                                }))}
-                              >
-                                <MessageSquareText className="w-4 h-4" />
-                                {isBusy && actionState.action === 'request_vendor_clarification' ? 'Requesting...' : 'Request Vendor Clarification'}
-                              </button>
+                              {!isPaymentAuthorizationItem && (
+                                <button
+                                  type="button"
+                                  className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl border border-amber-300 bg-amber-50 text-amber-900 text-sm font-medium hover:bg-amber-100 disabled:opacity-60 disabled:cursor-not-allowed"
+                                  disabled={isBusy || !canSubmit}
+                                  onClick={() => runItemAction(item, 'request_vendor_clarification', ({ reviewer, notes }) => resolveAgentReviewItem({
+                                    reviewItemId: item.id,
+                                    reviewer,
+                                    action: 'request_vendor_clarification',
+                                    resolutionNotes: notes,
+                                  }))}
+                                >
+                                  <MessageSquareText className="w-4 h-4" />
+                                  {isBusy && actionState.action === 'request_vendor_clarification' ? 'Requesting...' : 'Request Vendor Clarification'}
+                                </button>
+                              )}
                               <button
                                 type="button"
                                 className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl border border-red-300 bg-red-50 text-red-700 text-sm font-medium hover:bg-red-100 disabled:opacity-60 disabled:cursor-not-allowed"
                                 disabled={isBusy || !canSubmit}
-                                onClick={() => runItemAction(item, 'reject', ({ reviewer, notes }) => rejectAgentReviewItem({
-                                  reviewItemId: item.id,
-                                  reviewer,
-                                  resolutionNotes: notes,
-                                }))}
+                                onClick={() => runItemAction(
+                                  item,
+                                  isPaymentAuthorizationItem ? 'reject_payment_authorization' : 'reject',
+                                  ({ reviewer, notes }) => (
+                                    isPaymentAuthorizationItem
+                                      ? rejectPaymentAuthorization({ requestId: item.entity_id, rejectedBy: reviewer })
+                                      : rejectAgentReviewItem({
+                                        reviewItemId: item.id,
+                                        reviewer,
+                                        resolutionNotes: notes,
+                                      })
+                                  ),
+                                )}
                               >
                                 <XCircle className="w-4 h-4" />
-                                {isBusy && actionState.action === 'reject' ? 'Rejecting...' : 'Reject'}
+                                {isBusy && (actionState.action === 'reject' || actionState.action === 'reject_payment_authorization')
+                                  ? 'Rejecting...'
+                                  : (isPaymentAuthorizationItem ? 'Reject Payment Authorization' : 'Reject')}
                               </button>
                             </div>
                           </div>

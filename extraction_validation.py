@@ -212,6 +212,7 @@ def _create_review_item_best_effort(
                 "json_path": result.json_path,
                 "issues": [issue.to_dict() for issue in result.issues],
                 "duplicate_candidates": result.duplicate_candidates,
+                "extracted_fields": result.extracted_fields or {},
             },
         )
         return review_item["id"]

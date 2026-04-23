@@ -325,6 +325,183 @@ def _load_invoice_summaries(invoice_ids: Sequence[str]) -> Dict[str, Dict[str, A
             return summaries
 
 
+def _load_segment_invoice_ids(segment_ids: Sequence[str]) -> Dict[str, Optional[str]]:
+    normalized_segment_ids = [str(segment_id) for segment_id in segment_ids if segment_id]
+    if not normalized_segment_ids:
+        return {}
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, invoice_id, metadata
+                FROM source_document_segments
+                WHERE id = ANY(%s)
+                """,
+                (normalized_segment_ids,),
+            )
+            resolved: Dict[str, Optional[str]] = {}
+            for row in cur.fetchall():
+                segment_id = str(row[0])
+                invoice_id = str(row[1]) if row[1] else None
+                metadata = _json_value(row[2], {})
+                if not invoice_id:
+                    invoice_id = (metadata.get("persistence") or {}).get("invoice_id")
+                    invoice_id = str(invoice_id) if invoice_id else None
+                resolved[segment_id] = invoice_id
+            return resolved
+
+
+def _load_extracted_fields_from_review_metadata(metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    extracted_fields = metadata.get("extracted_fields")
+    if isinstance(extracted_fields, dict) and extracted_fields:
+        return extracted_fields
+
+    json_path = metadata.get("json_path")
+    if not json_path:
+        return None
+
+    try:
+        with open(json_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return None
+
+    return payload if isinstance(payload, dict) else None
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _invoice_summary_from_extracted_fields(
+    extracted_fields: Optional[Dict[str, Any]],
+    *,
+    invoice_id: Optional[str] = None,
+    status: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(extracted_fields, dict) or not extracted_fields:
+        return None
+
+    supplier_name = str(extracted_fields.get("supplier_name") or "").strip()
+    vendor_name = str(extracted_fields.get("vendor_name") or supplier_name).strip()
+    invoice_date = extracted_fields.get("invoice_date")
+    invoice_date = str(invoice_date).strip() if invoice_date else None
+
+    return {
+        "id": str(invoice_id) if invoice_id else None,
+        "invoice_number": str(extracted_fields.get("invoice_number") or "").strip(),
+        "invoice_date": invoice_date or None,
+        "total_amount": _coerce_float(extracted_fields.get("total_amount")),
+        "status": str(status or extracted_fields.get("status") or "").strip(),
+        "po_number": str(extracted_fields.get("po_number") or "").strip(),
+        "currency": str(extracted_fields.get("currency") or "USD").strip() or "USD",
+        "supplier_name": supplier_name,
+        "vendor_name": vendor_name or supplier_name or "Unknown Vendor",
+    }
+
+
+def _load_payment_authorization_summaries(request_ids: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+    normalized_request_ids = [str(request_id) for request_id in request_ids if request_id]
+    if not normalized_request_ids:
+        return {}
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  id,
+                  approval_status,
+                  invoice_ids,
+                  customer,
+                  currency,
+                  save_method,
+                  total_amount,
+                  invoice_count,
+                  risk_level,
+                  recommendation,
+                  risk_reasons,
+                  metadata
+                FROM payment_authorization_requests
+                WHERE id = ANY(%s)
+                """,
+                (normalized_request_ids,),
+            )
+            summaries: Dict[str, Dict[str, Any]] = {}
+            for row in cur.fetchall():
+                metadata = _json_value(row[11], {})
+                customer = _json_value(row[3], {})
+                invoice_ids = _json_value(row[2], [])
+                invoice_summaries = metadata.get("invoice_summaries") or []
+                vendor_names = list(
+                    dict.fromkeys(
+                        [
+                            str(invoice.get("supplier_name") or "").strip()
+                            for invoice in invoice_summaries
+                            if str(invoice.get("supplier_name") or "").strip()
+                        ]
+                    )
+                )
+                if not vendor_names:
+                    vendor_names = list(
+                        dict.fromkeys(
+                            [
+                                str(invoice.get("vendor_name") or "").strip()
+                                for invoice in invoice_summaries
+                                if str(invoice.get("vendor_name") or "").strip()
+                            ]
+                        )
+                    )
+                summaries[str(row[0])] = {
+                    "id": str(row[0]),
+                    "approval_status": row[1] or "pending_approval",
+                    "invoice_ids": invoice_ids,
+                    "customer": customer,
+                    "currency": row[4] or "USD",
+                    "save_method": bool(row[5]),
+                    "total_amount": float(row[6]) if row[6] is not None else None,
+                    "invoice_count": int(row[7] or 0),
+                    "risk_level": row[8] or "medium",
+                    "recommendation": row[9] or "approval_required",
+                    "risk_reasons": _json_value(row[10], []),
+                    "risk_signals": metadata.get("risk_signals") or {},
+                    "invoice_summaries": invoice_summaries,
+                    "vendor_names": vendor_names,
+                }
+            return summaries
+
+
+def _resolve_review_item_invoice_ids(items: Sequence[Dict[str, Any]]) -> Dict[str, Optional[str]]:
+    resolved: Dict[str, Optional[str]] = {}
+    segment_ids: List[str] = []
+
+    for item in items:
+        metadata = item.get("metadata") or {}
+        persistence = metadata.get("persistence") or {}
+        invoice_id = item.get("invoice_id") or persistence.get("invoice_id")
+        if invoice_id:
+            resolved[item["id"]] = str(invoice_id)
+            continue
+        if item.get("entity_type") == "source_document_segment" and item.get("entity_id"):
+            segment_ids.append(str(item["entity_id"]))
+
+    segment_invoice_ids = _load_segment_invoice_ids(segment_ids)
+    for item in items:
+        if item["id"] in resolved:
+            continue
+        if item.get("entity_type") == "source_document_segment":
+            resolved[item["id"]] = segment_invoice_ids.get(str(item.get("entity_id") or ""))
+        else:
+            resolved[item["id"]] = None
+    return resolved
+
+
 def _review_candidate_pos(metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
     candidate_sources = []
     analysis = metadata.get("analysis") or {}
@@ -362,27 +539,88 @@ def _review_candidate_pos(metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
     )
 
 
+def _payment_authorization_invoice_summary(summary: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not summary:
+        return None
+
+    invoice_summaries = summary.get("invoice_summaries") or []
+    primary_invoice = invoice_summaries[0] if invoice_summaries else {}
+    vendor_names = summary.get("vendor_names") or []
+    vendor_name = ""
+    if len(vendor_names) == 1:
+        vendor_name = vendor_names[0]
+    elif len(vendor_names) > 1:
+        vendor_name = f"{len(vendor_names)} vendors"
+
+    invoice_number = (
+        primary_invoice.get("invoice_number")
+        if summary.get("invoice_count") == 1 and primary_invoice
+        else f"{summary.get('invoice_count') or 0} invoices"
+    )
+
+    return {
+        "id": primary_invoice.get("id"),
+        "invoice_number": invoice_number,
+        "invoice_date": primary_invoice.get("due_date"),
+        "total_amount": summary.get("total_amount"),
+        "status": summary.get("approval_status"),
+        "po_number": primary_invoice.get("po_number") or "",
+        "currency": summary.get("currency") or primary_invoice.get("currency") or "USD",
+        "supplier_name": vendor_name,
+        "vendor_name": vendor_name,
+    }
+
+
 def _enrich_human_review_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    invoice_ids = [item.get("invoice_id") for item in items if item.get("invoice_id")]
+    resolved_invoice_ids = _resolve_review_item_invoice_ids(items)
+    invoice_ids = [invoice_id for invoice_id in resolved_invoice_ids.values() if invoice_id]
     invoice_summaries = _load_invoice_summaries(invoice_ids)
+    payment_authorization_ids = [
+        str(item.get("entity_id"))
+        for item in items
+        if item.get("entity_type") == "payment_authorization" and item.get("entity_id")
+    ]
+    payment_authorization_summaries = _load_payment_authorization_summaries(payment_authorization_ids)
 
     enriched_items = []
     for item in items:
         metadata = item.get("metadata") or {}
+        effective_invoice_id = resolved_invoice_ids.get(item["id"])
+        payment_authorization_summary = (
+            payment_authorization_summaries.get(str(item.get("entity_id")))
+            if item.get("entity_type") == "payment_authorization"
+            else None
+        )
         resolution_packet = metadata.get("resolution_packet") or {}
         attempts = resolution_packet.get("attempts") or []
         recommended_action = (
             metadata.get("recommended_action")
             or resolution_packet.get("recommended_action")
+            or (
+                "Approve to allow payment execution, or reject to stop this payment batch."
+                if item.get("entity_type") == "payment_authorization"
+                else None
+            )
             or metadata.get("summary")
             or "Review the packet and decide the next step."
         )
         candidate_pos = _review_candidate_pos(metadata)
+        invoice_summary = (
+            invoice_summaries.get(effective_invoice_id)
+            or _payment_authorization_invoice_summary(payment_authorization_summary)
+        )
+        if not invoice_summary:
+            invoice_summary = _invoice_summary_from_extracted_fields(
+                _load_extracted_fields_from_review_metadata(metadata),
+                invoice_id=effective_invoice_id,
+                status=(metadata.get("persistence") or {}).get("invoice_status"),
+            )
         enriched = {
             **item,
+            "invoice_id": effective_invoice_id,
             "display_status": _review_status_display(item.get("status")),
             "review_reason_label": _review_reason_label(item.get("review_reason")),
-            "invoice_summary": invoice_summaries.get(item.get("invoice_id")),
+            "invoice_summary": invoice_summary,
             "automated_attempt_count": int(
                 resolution_packet.get("attempt_count")
                 or len(attempts)
@@ -391,6 +629,7 @@ def _enrich_human_review_items(items: List[Dict[str, Any]]) -> List[Dict[str, An
             "recommended_action": recommended_action,
             "resolution_packet": resolution_packet,
             "candidate_pos": candidate_pos,
+            "payment_authorization_summary": payment_authorization_summary,
             "is_urgent": int(item.get("priority") or 100) <= 80,
         }
         enriched_items.append(enriched)
@@ -1404,6 +1643,7 @@ def create_human_review_item(
 def update_human_review_item(
     review_item_id: str,
     *,
+    invoice_id: Optional[str] = None,
     status: Optional[str] = None,
     assigned_to: Optional[str] = None,
     resolution: Optional[str] = None,
@@ -1417,13 +1657,11 @@ def update_human_review_item(
                 """
                 UPDATE human_review_queue
                 SET
+                  invoice_id = COALESCE(%s, invoice_id),
                   status = COALESCE(%s, status),
                   assigned_to = COALESCE(%s, assigned_to),
                   resolution = COALESCE(%s, resolution),
-                  resolved_at = CASE
-                    WHEN %s IS NULL THEN resolved_at
-                    ELSE %s
-                  END,
+                  resolved_at = COALESCE(%s::timestamptz, resolved_at),
                   metadata = CASE
                     WHEN %s THEN metadata
                     ELSE COALESCE(metadata, '{}'::jsonb) || %s
@@ -1436,10 +1674,10 @@ def update_human_review_item(
                   due_at, resolution, metadata, created_at, updated_at, resolved_at
                 """,
                 (
+                    invoice_id,
                     status,
                     assigned_to,
                     resolution,
-                    resolved_at,
                     resolved_at,
                     metadata is None,
                     _jsonb(metadata, {}),

@@ -5,7 +5,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from email_client import fetch_and_process_invoices
 from storage_local import upload_invoice as save_invoice_file
 from invoice_db import get_dashboard_stats,get_graph_data,get_recent_invoices,get_invoice_by_id,get_exception_invoices,get_payable_invoices
-from payments import create_payment_intent_for_invoices, mark_payment_failed_or_canceled, confirm_payment_intent
+from payments import create_payment_intent_for_invoices, mark_payment_failed_or_canceled, confirm_payment_intent, list_pending_payment_confirmations, list_payment_history
 import stripe
 from vendor_db import get_vendors,get_all_vendors_detailed,get_vendor_stats,get_vendor_by_id_detailed,create_vendor,delete_vendor
 from chat_db import create_chat as db_create_chat, list_messages as db_list_messages, add_message as db_add_message, get_chat_vendor, list_chats_for_vendor as db_list_chats
@@ -1224,6 +1224,24 @@ def api_create_payment_intent():
         save_method = bool(data.get("saveMethod"))
         result = create_payment_intent_for_invoices(invoice_ids, customer, currency, save_method)
         return jsonify(result)
+    except Exception as e:
+        return _error_response(e, default_status=400)
+
+@app.route("/api/payments/pending-confirmations", methods=["GET"])
+def api_pending_payment_confirmations():
+    try:
+        limit = int(request.args.get("limit", "25"))
+        return jsonify(list_pending_payment_confirmations(limit=limit))
+    except Exception as e:
+        return _error_response(e, default_status=400)
+
+@app.route("/api/payments/history", methods=["GET"])
+def api_payment_history():
+    try:
+        limit = int(request.args.get("limit", "25"))
+        vendor_id = request.args.get("vendor_id")
+        currency = request.args.get("currency")
+        return jsonify(list_payment_history(limit=limit, vendor_id=vendor_id, currency=currency))
     except Exception as e:
         return _error_response(e, default_status=400)
 

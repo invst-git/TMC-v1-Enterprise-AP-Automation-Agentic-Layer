@@ -151,8 +151,8 @@ def list_payment_authorization_requests(
                   rejected_at, executed_payment_id, executed_payment_intent_id,
                   created_at, updated_at
                 FROM payment_authorization_requests
-                WHERE (%s IS NULL OR approval_status = %s)
-                  AND (%s IS NULL OR risk_level = %s)
+                WHERE (%s::text IS NULL OR approval_status = %s::text)
+                  AND (%s::text IS NULL OR risk_level = %s::text)
                 ORDER BY created_at DESC
                 LIMIT %s
                 """,
@@ -172,6 +172,8 @@ def update_payment_authorization_request(
     *,
     review_item_id: Optional[str] = None,
     approval_status: Optional[str] = None,
+    customer: Optional[Dict[str, Any]] = None,
+    save_method: Optional[bool] = None,
     metadata: Optional[Dict[str, Any]] = None,
     approved_by: Optional[str] = None,
     approved_at: Optional[Any] = None,
@@ -189,14 +191,19 @@ def update_payment_authorization_request(
                 SET
                   review_item_id = COALESCE(%s, review_item_id),
                   approval_status = COALESCE(%s, approval_status),
+                  customer = CASE
+                    WHEN %s THEN customer
+                    ELSE %s
+                  END,
+                  save_method = COALESCE(%s, save_method),
                   metadata = CASE
                     WHEN %s THEN metadata
                     ELSE COALESCE(metadata, '{}'::jsonb) || %s
                   END,
                   approved_by = COALESCE(%s, approved_by),
-                  approved_at = COALESCE(%s, approved_at),
+                  approved_at = COALESCE(%s::timestamptz, approved_at),
                   rejected_by = COALESCE(%s, rejected_by),
-                  rejected_at = COALESCE(%s, rejected_at),
+                  rejected_at = COALESCE(%s::timestamptz, rejected_at),
                   executed_payment_id = COALESCE(%s, executed_payment_id),
                   executed_payment_intent_id = COALESCE(%s, executed_payment_intent_id),
                   updated_at = now()
@@ -211,6 +218,9 @@ def update_payment_authorization_request(
                 (
                     review_item_id,
                     approval_status,
+                    customer is None,
+                    _jsonb(customer, {}),
+                    save_method,
                     metadata is None,
                     _jsonb(metadata, {}),
                     approved_by,
