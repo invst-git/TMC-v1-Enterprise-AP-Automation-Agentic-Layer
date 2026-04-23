@@ -2245,6 +2245,22 @@ def _review_override_payload(review_item: Dict[str, Any]) -> Optional[Dict[str, 
     }
 
 
+def _event_counts_toward_processing_time(event: Dict[str, Any]) -> bool:
+    if event.get("type") != "state_change":
+        return True
+
+    event_type = str(event.get("event_type") or "").strip().lower()
+    after_state = str(event.get("after_state") or "").strip().lower()
+
+    # Payment-side invoice status syncs happen after the invoice is already
+    # ready for payment, so they should not extend processing-time metrics.
+    if event_type == "invoice_status_synced":
+        return False
+    if after_state in {"payment_pending", "paid"}:
+        return False
+    return True
+
+
 def get_invoice_audit_trail(invoice_id: str, *, limit: int = 500) -> Optional[Dict[str, Any]]:
     limit = _coerce_limit(limit, default=500, max_value=1000)
     with get_conn() as conn:
@@ -2371,7 +2387,11 @@ def get_invoice_audit_trail(invoice_id: str, *, limit: int = 500) -> Optional[Di
         )
     )
 
-    timestamps = [_parse_iso_datetime(item.get("timestamp")) for item in events if item.get("timestamp")]
+    timestamps = [
+        _parse_iso_datetime(item.get("timestamp"))
+        for item in events
+        if item.get("timestamp") and _event_counts_toward_processing_time(item)
+    ]
     timestamps = [value for value in timestamps if value is not None]
     first_event_at = timestamps[0].isoformat() if timestamps else None
     last_event_at = timestamps[-1].isoformat() if timestamps else None
@@ -2875,7 +2895,10 @@ def get_agent_operations_metrics(*, window_days: int = 30) -> Dict[str, Any]:
                     FROM (
                       SELECT entity_id, created_at
                       FROM workflow_state_history
-                      WHERE entity_type = 'invoice' AND entity_id::text = ANY(%s)
+                      WHERE entity_type = 'invoice'
+                        AND entity_id::text = ANY(%s)
+                        AND COALESCE(event_type, '') <> 'invoice_status_synced'
+                        AND COALESCE(to_state, '') NOT IN ('payment_pending', 'paid')
                       UNION ALL
                       SELECT entity_id, created_at
                       FROM agent_decisions

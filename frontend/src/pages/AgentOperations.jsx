@@ -179,7 +179,7 @@ const AgentOperations = () => {
               <Clock3 className="w-4 h-4 text-gray-500" />
             </div>
             <p className="text-3xl font-semibold text-black">{formatDuration(metrics.average_processing_time_seconds)}</p>
-            <p className="text-sm text-gray-500 mt-2">From first recorded invoice event to the latest one.</p>
+            <p className="text-sm text-gray-500 mt-2">From first recorded invoice event to the payment-ready handoff.</p>
           </div>
 
           <div className="bg-white border border-gray-200 rounded-2xl p-5 sm:p-6">
