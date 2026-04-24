@@ -63,6 +63,23 @@ const handleResponse = async (response) => {
   return response.text();
 };
 
+const getInFlight = new Map();
+
+const getJson = async (url) => {
+  if (getInFlight.has(url)) {
+    return getInFlight.get(url);
+  }
+
+  const request = fetch(url)
+    .then(handleResponse)
+    .finally(() => {
+      getInFlight.delete(url);
+    });
+
+  getInFlight.set(url, request);
+  return request;
+};
+
 export const subscribeToLiveUpdates = ({
   onOpen,
   onChange,
@@ -126,51 +143,48 @@ const extractLogsFromHtml = (html) => {
 
 // Fetch dashboard statistics
 export const fetchDashboardStats = async () => {
-  const response = await fetch(`${API_BASE_URL}/dashboard/stats`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/dashboard/stats`);
 };
 
 // Fetch graph data for last 30 days
 export const fetchGraphData = async () => {
-  const response = await fetch(`${API_BASE_URL}/dashboard/graph-data`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/dashboard/graph-data`);
 };
 
 // Fetch recent invoices
 export const fetchRecentInvoices = async (limit = 10) => {
-  const response = await fetch(`${API_BASE_URL}/invoices/recent?limit=${limit}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/invoices/recent?limit=${limit}`);
 };
 
 // Fetch single invoice by ID (includes extended fields)
 export const fetchInvoiceById = async (invoiceId) => {
-  const response = await fetch(`${API_BASE_URL}/invoices/${invoiceId}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/invoices/${invoiceId}`);
 };
 
 export const fetchInvoiceAuditTrail = async (invoiceId, { limit = 500 } = {}) => {
   const params = new URLSearchParams();
   if (limit) params.set('limit', String(limit));
-  const response = await fetch(`${API_BASE_URL}/invoices/${invoiceId}/audit-trail?${params.toString()}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/invoices/${invoiceId}/audit-trail?${params.toString()}`);
 };
 
 // Fetch all vendors
 export const fetchVendors = async () => {
-  const response = await fetch(`${API_BASE_URL}/vendors`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/vendors`);
+};
+
+// Fetch lightweight vendor options for filters/dropdowns
+export const fetchVendorOptions = async () => {
+  return getJson(`${API_BASE_URL}/vendors/options`);
 };
 
 // Fetch vendor statistics
 export const fetchVendorStats = async () => {
-  const response = await fetch(`${API_BASE_URL}/vendors/stats`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/vendors/stats`);
 };
 
 // Fetch single vendor by ID (now includes purchase orders and invoice list)
 export const fetchVendorById = async (vendorId) => {
-  const response = await fetch(`${API_BASE_URL}/vendors/${vendorId}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/vendors/${vendorId}`);
 };
 
 // Create vendor
@@ -195,8 +209,7 @@ export const fetchVendorMentions = async ({ vendorId, kind = 'invoices', q = '',
   params.set('kind', kind);
   if (q) params.set('q', q);
   params.set('limit', String(limit));
-  const response = await fetch(`${API_BASE_URL}/vendors/${vendorId}/mentions?${params.toString()}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/vendors/${vendorId}/mentions?${params.toString()}`);
 };
 
 // Chat lifecycle
@@ -213,8 +226,7 @@ export const getVendorChatMessages = async ({ vendorId, chatId, limit = 50, befo
   const params = new URLSearchParams();
   params.set('limit', String(limit));
   if (before) params.set('before', before);
-  const response = await fetch(`${API_BASE_URL}/vendors/${vendorId}/chat/${chatId}/messages?${params.toString()}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/vendors/${vendorId}/chat/${chatId}/messages?${params.toString()}`);
 };
 
 export const sendVendorChatMessage = async ({ vendorId, chatId, prompt, tags }) => {
@@ -229,14 +241,12 @@ export const sendVendorChatMessage = async ({ vendorId, chatId, prompt, tags }) 
 export const listVendorChats = async ({ vendorId, limit = 20 }) => {
   const params = new URLSearchParams();
   params.set('limit', String(limit));
-  const response = await fetch(`${API_BASE_URL}/vendors/${vendorId}/chat?${params.toString()}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/vendors/${vendorId}/chat?${params.toString()}`);
 };
 
 // Fetch single purchase order by ID
 export const fetchPurchaseOrderById = async (poId) => {
-  const response = await fetch(`${API_BASE_URL}/purchase-orders/${poId}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/purchase-orders/${poId}`);
 };
 
 // Fetch exception invoices with optional filters
@@ -245,8 +255,7 @@ export const fetchExceptionInvoices = async ({ vendorId, status, limit = 100 } =
   if (vendorId) params.set('vendor_id', vendorId);
   if (status) params.set('status', status);
   if (limit) params.set('limit', String(limit));
-  const response = await fetch(`${API_BASE_URL}/invoices/exceptions?${params.toString()}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/invoices/exceptions?${params.toString()}`);
 };
 
 // Fetch payable invoices (eligible for payment)
@@ -255,15 +264,13 @@ export const fetchPayableInvoices = async ({ vendorId, currency, limit = 200 } =
   if (vendorId) params.set('vendor_id', vendorId);
   if (currency) params.set('currency', currency);
   if (limit) params.set('limit', String(limit));
-  const response = await fetch(`${API_BASE_URL}/invoices/payable?${params.toString()}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/invoices/payable?${params.toString()}`);
 };
 
 export const fetchPendingPaymentConfirmations = async ({ limit = 25 } = {}) => {
   const params = new URLSearchParams();
   if (limit) params.set('limit', String(limit));
-  const response = await fetch(`/api/payments/pending-confirmations?${params.toString()}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/payments/pending-confirmations?${params.toString()}`);
 };
 
 export const fetchPaymentHistory = async ({ vendorId, currency, limit = 25 } = {}) => {
@@ -271,20 +278,17 @@ export const fetchPaymentHistory = async ({ vendorId, currency, limit = 25 } = {
   if (vendorId) params.set('vendor_id', vendorId);
   if (currency) params.set('currency', currency);
   if (limit) params.set('limit', String(limit));
-  const response = await fetch(`/api/payments/history?${params.toString()}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/payments/history?${params.toString()}`);
 };
 
 export const fetchAgentOverview = async () => {
-  const response = await fetch(`${API_BASE_URL}/agent/overview`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/agent/overview`);
 };
 
 export const fetchAgentOperationsMetrics = async ({ days = 30 } = {}) => {
   const params = new URLSearchParams();
   if (days) params.set('days', String(days));
-  const response = await fetch(`${API_BASE_URL}/agent/operations/metrics?${params.toString()}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/agent/operations/metrics?${params.toString()}`);
 };
 
 export const fetchAgentSourceDocuments = async ({
@@ -302,13 +306,11 @@ export const fetchAgentSourceDocuments = async ({
   if (vendorId) params.set('vendor_id', vendorId);
   if (sourceType) params.set('source_type', sourceType);
   if (limit) params.set('limit', String(limit));
-  const response = await fetch(`${API_BASE_URL}/agent/source-documents?${params.toString()}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/agent/source-documents?${params.toString()}`);
 };
 
 export const fetchAgentSourceDocumentDetail = async (sourceDocumentId) => {
-  const response = await fetch(`${API_BASE_URL}/agent/source-documents/${sourceDocumentId}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/agent/source-documents/${sourceDocumentId}`);
 };
 
 export const fetchAgentWorkflowStates = async ({
@@ -322,15 +324,13 @@ export const fetchAgentWorkflowStates = async ({
   if (currentState) params.set('current_state', currentState);
   if (currentStage) params.set('current_stage', currentStage);
   if (limit) params.set('limit', String(limit));
-  const response = await fetch(`${API_BASE_URL}/agent/workflow-states?${params.toString()}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/agent/workflow-states?${params.toString()}`);
 };
 
 export const fetchAgentWorkflowHistory = async ({ entityType, entityId, limit = 100 }) => {
   const params = new URLSearchParams();
   if (limit) params.set('limit', String(limit));
-  const response = await fetch(`${API_BASE_URL}/agent/workflow-history/${entityType}/${entityId}?${params.toString()}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/agent/workflow-history/${entityType}/${entityId}?${params.toString()}`);
 };
 
 export const fetchAgentTasks = async ({
@@ -350,8 +350,7 @@ export const fetchAgentTasks = async ({
   if (sourceDocumentId) params.set('source_document_id', sourceDocumentId);
   if (retriesOnly) params.set('retries_only', 'true');
   if (limit) params.set('limit', String(limit));
-  const response = await fetch(`${API_BASE_URL}/agent/tasks?${params.toString()}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/agent/tasks?${params.toString()}`);
 };
 
 export const fetchAgentDecisions = async ({
@@ -367,8 +366,7 @@ export const fetchAgentDecisions = async ({
   if (taskId) params.set('task_id', taskId);
   if (sourceDocumentId) params.set('source_document_id', sourceDocumentId);
   if (limit) params.set('limit', String(limit));
-  const response = await fetch(`${API_BASE_URL}/agent/decisions?${params.toString()}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/agent/decisions?${params.toString()}`);
 };
 
 export const fetchAgentReviewQueue = async ({
@@ -392,13 +390,11 @@ export const fetchAgentReviewQueue = async ({
   if (invoiceId) params.set('invoice_id', invoiceId);
   if (assignedTo) params.set('assigned_to', assignedTo);
   if (limit) params.set('limit', String(limit));
-  const response = await fetch(`${API_BASE_URL}/agent/review-queue?${params.toString()}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/agent/review-queue?${params.toString()}`);
 };
 
 export const fetchAgentReviewQueueCounts = async () => {
-  const response = await fetch(`${API_BASE_URL}/agent/review-queue/counts`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/agent/review-queue/counts`);
 };
 
 export const assignAgentReviewItem = async ({ reviewItemId, reviewer }) => {
@@ -442,8 +438,7 @@ export const fetchAgentSlaConfigs = async ({ entityType, activeOnly = false } = 
   const params = new URLSearchParams();
   if (entityType) params.set('entity_type', entityType);
   if (activeOnly) params.set('active_only', 'true');
-  const response = await fetch(`${API_BASE_URL}/agent/sla-configs?${params.toString()}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/agent/sla-configs?${params.toString()}`);
 };
 
 export const fetchAgentSlaBreaches = async ({
@@ -455,8 +450,7 @@ export const fetchAgentSlaBreaches = async ({
   if (entityType) params.set('entity_type', entityType);
   if (currentState) params.set('current_state', currentState);
   if (limit) params.set('limit', String(limit));
-  const response = await fetch(`${API_BASE_URL}/agent/sla-breaches?${params.toString()}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/agent/sla-breaches?${params.toString()}`);
 };
 
 export const fetchVendorCommunications = async ({
@@ -474,13 +468,11 @@ export const fetchVendorCommunications = async ({
   if (invoiceId) params.set('invoice_id', invoiceId);
   if (sourceDocumentId) params.set('source_document_id', sourceDocumentId);
   if (limit) params.set('limit', String(limit));
-  const response = await fetch(`${API_BASE_URL}/agent/vendor-communications?${params.toString()}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/agent/vendor-communications?${params.toString()}`);
 };
 
 export const fetchVendorCommunicationById = async (communicationId) => {
-  const response = await fetch(`${API_BASE_URL}/agent/vendor-communications/${communicationId}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/agent/vendor-communications/${communicationId}`);
 };
 
 export const createVendorCommunicationDraft = async ({
@@ -532,13 +524,11 @@ export const fetchPaymentAuthorizations = async ({
   if (approvalStatus) params.set('approval_status', approvalStatus);
   if (riskLevel) params.set('risk_level', riskLevel);
   if (limit) params.set('limit', String(limit));
-  const response = await fetch(`${API_BASE_URL}/agent/payments/authorizations?${params.toString()}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/agent/payments/authorizations?${params.toString()}`);
 };
 
 export const fetchPaymentAuthorizationById = async (requestId) => {
-  const response = await fetch(`${API_BASE_URL}/agent/payments/authorizations/${requestId}`);
-  return await handleResponse(response);
+  return getJson(`${API_BASE_URL}/agent/payments/authorizations/${requestId}`);
 };
 
 export const requestPaymentAuthorization = async ({

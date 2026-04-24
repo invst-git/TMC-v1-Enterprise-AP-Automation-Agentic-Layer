@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import Sidebar from '../components/Sidebar';
-import { fetchExceptionInvoices, fetchVendors, getStatusLabel, formatCurrency } from '../services/api';
+import { fetchExceptionInvoices, fetchVendorOptions, getStatusLabel, formatCurrency } from '../services/api';
 import InvoiceDetailModal from '../components/InvoiceDetailModal';
 import { useLiveRefresh } from '../lib/useLiveRefresh';
 import { getPageCache, setPageCache } from '../lib/pageCache';
@@ -43,7 +43,7 @@ const Exceptions = () => {
         setLoading(true);
       }
       const [vData, exData] = await Promise.all([
-        fetchVendors(),
+        fetchVendorOptions(),
         fetchExceptionInvoices({ vendorId: selectedVendorId || undefined, status: statusFilter || undefined, limit: 200 })
       ]);
       setVendors(vData);

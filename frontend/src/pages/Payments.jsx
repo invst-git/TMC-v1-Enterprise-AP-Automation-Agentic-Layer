@@ -4,7 +4,7 @@ import {
   fetchPayableInvoices,
   fetchPendingPaymentConfirmations,
   fetchPaymentHistory,
-  fetchVendors,
+  fetchVendorOptions,
   formatCurrency,
   getStatusLabel,
   routePaymentBatch,
@@ -290,7 +290,7 @@ const Payments = () => {
         setLoading(true);
       }
       const [vData, invData, pendingData, historyData] = await Promise.all([
-        fetchVendors(),
+        fetchVendorOptions(),
         fetchPayableInvoices({ vendorId: selectedVendorId || undefined, currency: currency || undefined, limit: 200 }),
         fetchPendingPaymentConfirmations({ limit: 20 }),
         fetchPaymentHistory({ vendorId: selectedVendorId || undefined, currency: currency || undefined, limit: 20 }),

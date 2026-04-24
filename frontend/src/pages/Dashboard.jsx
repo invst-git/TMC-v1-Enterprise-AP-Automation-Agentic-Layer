@@ -8,7 +8,7 @@ import {
   fetchDashboardStats,
   fetchGraphData,
   fetchRecentInvoices,
-  fetchVendors,
+  fetchVendorOptions,
   runNow,
   uploadInvoice,
   formatCurrency,
@@ -69,7 +69,7 @@ const Dashboard = () => {
         fetchDashboardStats(),
         fetchGraphData(),
         fetchRecentInvoices(8),
-        fetchVendors()
+        fetchVendorOptions()
       ]);
       setStats(statsData);
       setGraphData(graphDataResponse);

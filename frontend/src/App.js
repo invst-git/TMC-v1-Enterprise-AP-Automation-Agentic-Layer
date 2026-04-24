@@ -1,4 +1,5 @@
 import "./App.css";
+import { useEffect } from "react";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import Dashboard from "./pages/Dashboard";
 import AgentOperations from "./pages/AgentOperations";
@@ -7,8 +8,13 @@ import Vendors from "./pages/Vendors";
 import Exceptions from "./pages/Exceptions";
 import Payments from "./pages/Payments";
 import { LiveRefreshProvider } from "./lib/liveRefreshContext";
+import { scheduleInitialDataWarmup } from "./lib/preloadData";
 
 function App() {
+  useEffect(() => {
+    scheduleInitialDataWarmup();
+  }, []);
+
   return (
     <div className="App">
       <BrowserRouter>

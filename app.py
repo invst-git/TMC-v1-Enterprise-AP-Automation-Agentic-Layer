@@ -757,6 +757,18 @@ def api_vendors_list():
     except Exception as e:
         return _error_response(e)
 
+@app.route("/api/vendors/options",methods=["GET"])
+def api_vendor_options():
+    """Get lightweight vendor options for filters and upload dropdowns."""
+    try:
+        vendors = [
+            {"id": str(row[0]), "name": row[1] or "Unknown Vendor"}
+            for row in get_vendors()
+        ]
+        return jsonify(vendors)
+    except Exception as e:
+        return _error_response(e)
+
 @app.route("/api/vendors/stats",methods=["GET"])
 def api_vendor_stats():
     """Get vendor summary statistics"""

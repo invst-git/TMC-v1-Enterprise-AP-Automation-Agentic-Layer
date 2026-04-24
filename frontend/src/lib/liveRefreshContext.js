@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
 import { subscribeToLiveUpdates } from '../services/api';
+import { scheduleWarmPageData } from './preloadData';
 
 const STALE_AFTER_MS = 4000;
 
@@ -53,7 +54,10 @@ export const LiveRefreshProvider = ({ children }) => {
 
     const subscription = subscribeToLiveUpdates({
       onOpen: (payload) => markConnected(payload, { bumpRevision: true }),
-      onChange: (payload) => markConnected(payload, { bumpRevision: true }),
+      onChange: (payload) => {
+        markConnected(payload, { bumpRevision: true });
+        scheduleWarmPageData({ delayMs: 1200, onlyExisting: true });
+      },
       onHeartbeat: (payload) => markConnected(payload, { bumpRevision: false }),
       onError: () => {
         if (closed) return;
